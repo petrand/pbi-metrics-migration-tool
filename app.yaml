@@ -1,0 +1,6 @@
+command:
+  - "node"
+  - "server.js"
+env:
+  - name: "PORT"
+    value: "8000"
