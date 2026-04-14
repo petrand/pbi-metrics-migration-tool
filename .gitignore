@@ -1,6 +1,77 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyz
+*.pyzw
+*.pyc.gz
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+.venv/
+venv/
+env/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+nosetests.xml
+pytest_cache/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+.pyre/
+
+# Node / frontend
 node_modules/
-frontend/node_modules/
 frontend/dist/
+frontend/node_modules/
+.npm
+.yarn-integrity
+.pnp
+.pnp.js
+
+# Vite / build cache
+.vite/
+frontend/.vite/
+frontend/coverage/
+
+# Environment & secrets
 .env
-*.log
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 .DS_Store
+Thumbs.db
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+Desktop.ini
+$RECYCLE.BIN/
+
+# Project-specific
+overrides.yaml

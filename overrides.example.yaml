@@ -1,0 +1,119 @@
+# Power BI to Databricks Migration Overrides
+# Copy this file to overrides.yaml and customize for your migration.
+# All sections are optional — include only what you need to override.
+
+# ---------------------------------------------------------------------------
+# Target catalog and schema for generated metric views
+# ---------------------------------------------------------------------------
+target:
+  catalog: my_catalog
+  schema: my_schema
+
+# ---------------------------------------------------------------------------
+# Table name mappings: Power BI table name -> Unity Catalog fully-qualified
+# table (catalog.schema.table or schema.table).
+# The tool uses these to rewrite FROM / JOIN clauses in generated SQL.
+# ---------------------------------------------------------------------------
+table_mappings:
+  FactSales: gold.fact_sales
+  DimProduct: gold.dim_product
+  DimCustomer: gold.dim_customer
+  DimDate: gold.dim_date
+
+# ---------------------------------------------------------------------------
+# Column name mappings per table.
+# Useful when Power BI column names differ from the Unity Catalog column names.
+# ---------------------------------------------------------------------------
+column_mappings:
+  FactSales:
+    SalesAmount: sales_amount
+    OrderDate: order_date
+  DimProduct:
+    ProductKey: product_key
+    ProductName: product_name
+
+# ---------------------------------------------------------------------------
+# Extra joins to inject into the generated SQL.
+# These are appended after the joins the tool detects automatically.
+# join_type defaults to INNER if omitted.
+# ---------------------------------------------------------------------------
+extra_joins:
+  - from_table: FactSales
+    from_column: region_code
+    to_table: DimRegion
+    to_column: code
+    join_type: LEFT
+
+# ---------------------------------------------------------------------------
+# Joins to exclude from the generated SQL.
+# Specify from_table and to_table; the tool will skip any join between them.
+# ---------------------------------------------------------------------------
+exclude_joins:
+  - from_table: FactSales
+    to_table: DimTemp
+
+# ---------------------------------------------------------------------------
+# Tables to exclude from the migration entirely.
+# Measures or dimensions that reference these tables will also be skipped.
+# ---------------------------------------------------------------------------
+exclude_tables:
+  - TempTable
+  - StagingLoad
+
+# ---------------------------------------------------------------------------
+# Columns to exclude per table.
+# The listed columns are dropped from SELECT and dimension definitions.
+# ---------------------------------------------------------------------------
+exclude_columns:
+  FactSales:
+    - internal_id
+    - etl_batch_id
+  DimCustomer:
+    - legacy_key
+
+# ---------------------------------------------------------------------------
+# Measure names to exclude from the migration.
+# Supports exact strings and glob patterns (e.g. "_Internal*").
+# ---------------------------------------------------------------------------
+exclude_measures:
+  - "_Internal Calc"
+  - "Debug *"
+
+# ---------------------------------------------------------------------------
+# Merge multiple fact tables into a single unified fact source.
+# target_source is the Unity Catalog table that the merged view will query.
+# ---------------------------------------------------------------------------
+merge_fact_groups:
+  - name: unified_sales
+    source_tables:
+      - FactSales
+      - FactReturns
+    target_source: gold.fact_sales_unified
+
+# ---------------------------------------------------------------------------
+# Manually override the generated SQL expression for a measure.
+# Use this when the automatic DAX-to-SQL translation is incorrect or
+# when you want to inject a hand-tuned expression.
+#   expr    - the SQL expression (use "source" as the table alias)
+#   comment - optional note stored alongside the metric view definition
+# ---------------------------------------------------------------------------
+measure_overrides:
+  "Complex KPI":
+    expr: "SUM(source.revenue) / NULLIF(COUNT(DISTINCT source.customer_id), 0)"
+    comment: "Manually translated — auto-translation of DIVIDE() was ambiguous"
+  "YTD Revenue":
+    expr: "SUM(CASE WHEN YEAR(source.order_date) = YEAR(CURRENT_DATE) THEN source.revenue ELSE 0 END)"
+    comment: "DAX DATESYTD replaced with inline CASE expression"
+
+# ---------------------------------------------------------------------------
+# Override display metadata for generated dimensions.
+#   display_name - human-readable label shown in the metric view
+#   description  - longer description stored as a column comment
+# ---------------------------------------------------------------------------
+dimension_overrides:
+  ProductName:
+    display_name: "Product"
+    description: "Product display name from DimProduct"
+  CustomerSegment:
+    display_name: "Customer Segment"
+    description: "Segment classification from DimCustomer"

@@ -1,0 +1,922 @@
+"""
+DAX-to-Databricks SQL Translation Engine
+
+Production-grade translator converting Power BI DAX expressions to
+Databricks SQL suitable for Metric Views (YAML v1.1 spec).
+Handles 30+ DAX functions/patterns with multi-pass resolution.
+"""
+
+import logging
+import re
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+class TranslationStatus(Enum):
+    CONVERTED = "converted"
+    PARTIAL = "partial"
+    UNSUPPORTED = "unsupported"
+    MANUAL_OVERRIDE = "manual_override"
+    EXCLUDED = "excluded"
+
+
+@dataclass
+class TranslationResult:
+    """Result of translating a single DAX expression to SQL."""
+    original_dax: str
+    translated_sql: str
+    status: str = "converted"
+    confidence: int = 100
+    applied_transformations: List[str] = field(default_factory=list)
+    issues: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    window_spec: Optional[dict] = None
+
+    def to_dict(self) -> dict:
+        d = {
+            "original_dax": self.original_dax,
+            "translated_sql": self.translated_sql,
+            "status": self.status,
+            "confidence": self.confidence,
+            "applied_transformations": self.applied_transformations,
+            "issues": self.issues,
+            "warnings": self.warnings,
+        }
+        if self.window_spec:
+            d["window_spec"] = self.window_spec
+        return d
+
+
+# ── Regex patterns for DAX parsing ──────────────────────────────────────
+
+# Table[Column] reference
+RE_TABLE_COL = re.compile(
+    r"'?(\w[\w\s]*?)'?\[(\w[\w\s]*?)\]", re.IGNORECASE
+)
+
+# DAX function call (function name + opening paren)
+RE_FUNC_CALL = re.compile(
+    r'\b([A-Z_][A-Z_0-9]*)\s*\(', re.IGNORECASE
+)
+
+# VAR ... RETURN pattern (multiline)
+RE_VAR_RETURN = re.compile(
+    r'\bVAR\s+(\w+)\s*=\s*(.*?)\s+RETURN\s+',
+    re.IGNORECASE | re.DOTALL
+)
+
+# Single VAR assignment
+RE_VAR_ASSIGN = re.compile(
+    r'\bVAR\s+(\w+)\s*=\s*', re.IGNORECASE
+)
+
+# Measure reference [Measure Name]
+RE_MEASURE_REF = re.compile(r'\[([^\]]+)\]')
+
+# Logical operators
+RE_AND_OP = re.compile(r'&&')
+RE_OR_OP = re.compile(r'\|\|')
+
+
+class DAXTranslator:
+    """Translates DAX expressions to Databricks SQL for metric views."""
+
+    def __init__(self, relationships: List[dict] = None, known_measures: Dict[str, str] = None):
+        """
+        Args:
+            relationships: List of relationship dicts with 'from' and 'to' keys.
+            known_measures: Dict mapping measure names to their translated SQL.
+        """
+        self._relationships = relationships or []
+        self._known_measures = known_measures or {}
+        self._join_map = self._build_join_map()
+        self._transformations = []
+        self._issues = []
+        self._warnings = []
+
+    def _build_join_map(self) -> Dict[str, str]:
+        """Build a mapping of Table.Column -> join_alias.column from relationships."""
+        jmap = {}
+        for rel in self._relationships:
+            from_parts = rel.get("from", "").split(".")
+            to_parts = rel.get("to", "").split(".")
+            if len(to_parts) == 2:
+                table = to_parts[0].strip("'").lower().replace(" ", "_")
+                col = to_parts[1].strip("'").lower().replace(" ", "_")
+                key = f"{to_parts[0].strip(chr(39))}.{to_parts[1].strip(chr(39))}".lower()
+                jmap[key] = f"{table}.{col}"
+        return jmap
+
+    def translate(self, dax_expr: str, table_name: str = "",
+                  measures: Dict[str, str] = None) -> TranslationResult:
+        """Translate a single DAX expression to Databricks SQL.
+
+        Args:
+            dax_expr: The DAX expression to translate.
+            table_name: Name of the table this measure belongs to.
+            measures: Optional dict of measure_name -> dax_expr for cross-refs.
+
+        Returns:
+            TranslationResult with translated SQL and metadata.
+        """
+        self._transformations = []
+        self._issues = []
+        self._warnings = []
+
+        if not dax_expr or not dax_expr.strip():
+            return TranslationResult(
+                original_dax=dax_expr or "",
+                translated_sql="",
+                status="unsupported",
+                confidence=0,
+                issues=["Empty DAX expression"],
+            )
+
+        if measures:
+            self._known_measures.update(measures)
+
+        sql = dax_expr.strip()
+
+        # Multi-pass translation
+        sql = self._pass_normalize(sql)
+        sql = self._pass_var_return(sql)
+        sql = self._pass_time_intelligence(sql)
+        window = self._extract_window_spec(dax_expr)
+        sql = self._pass_calculate(sql, table_name)
+        sql = self._pass_aggregations(sql, table_name)
+        sql = self._pass_conditional(sql)
+        sql = self._pass_logical(sql)
+        sql = self._pass_date_functions(sql)
+        sql = self._pass_text_functions(sql)
+        sql = self._pass_lookups(sql, table_name)
+        sql = self._pass_iterators(sql, table_name)
+        sql = self._pass_table_col_refs(sql, table_name)
+        sql = self._pass_measure_refs(sql)
+        sql = self._pass_cleanup(sql)
+
+        # Determine status and confidence
+        status, confidence = self._compute_status(sql, dax_expr)
+
+        return TranslationResult(
+            original_dax=dax_expr,
+            translated_sql=sql,
+            status=status,
+            confidence=confidence,
+            applied_transformations=list(self._transformations),
+            issues=list(self._issues),
+            warnings=list(self._warnings),
+            window_spec=window,
+        )
+
+    def translate_batch(self, measures: List[dict], table_name: str = "") -> List[TranslationResult]:
+        """Translate a batch of measures with multi-pass cross-reference resolution.
+
+        Args:
+            measures: List of dicts with 'name' and 'expression' keys.
+            table_name: Name of the fact table.
+
+        Returns:
+            List of TranslationResult objects.
+        """
+        # Build measure name -> expression map
+        measure_map = {m["name"]: m.get("expression", "") for m in measures}
+
+        # Multi-pass: resolve cross-references iteratively
+        results = {}
+        resolved = {}
+        max_passes = 5
+
+        for pass_num in range(max_passes):
+            new_resolved = 0
+            for m in measures:
+                name = m["name"]
+                if name in resolved:
+                    continue
+                result = self.translate(
+                    m.get("expression", ""), table_name, measures=resolved
+                )
+                if result.status in ("converted", "partial"):
+                    resolved[name] = result.translated_sql
+                    new_resolved += 1
+                results[name] = result
+
+            if new_resolved == 0:
+                break
+
+        # Final pass for any remaining unresolved
+        for m in measures:
+            name = m["name"]
+            if name not in results:
+                result = self.translate(m.get("expression", ""), table_name, measures=resolved)
+                results[name] = result
+
+        return [results.get(m["name"], TranslationResult(
+            original_dax=m.get("expression", ""),
+            translated_sql="",
+            status="unsupported",
+            confidence=0,
+            issues=["Failed to translate"],
+        )) for m in measures]
+
+    # ── Translation Passes ──────────────────────────────────────────────
+
+    def _pass_normalize(self, sql: str) -> str:
+        """Normalize whitespace and formatting."""
+        sql = re.sub(r'\s+', ' ', sql).strip()
+        # Remove trailing semicolons
+        sql = sql.rstrip(';').strip()
+        self._transformations.append("normalize")
+        return sql
+
+    def _pass_var_return(self, sql: str) -> str:
+        """Inline VAR x = expr RETURN result patterns."""
+        # Find all VAR assignments
+        vars_found = {}
+        var_pattern = re.compile(
+            r'\bVAR\s+(__\w+|\w+)\s*=\s*',
+            re.IGNORECASE
+        )
+
+        matches = list(var_pattern.finditer(sql))
+        if not matches:
+            return sql
+
+        # Parse VAR blocks - find the expression for each VAR
+        remaining = sql
+        for match in reversed(matches):
+            var_name = match.group(1)
+            start = match.end()
+            # Find the expression end (next VAR or RETURN)
+            next_kw = re.search(r'\b(VAR|RETURN)\b', remaining[start:], re.IGNORECASE)
+            if next_kw:
+                expr = remaining[start:start + next_kw.start()].strip()
+            else:
+                expr = remaining[start:].strip()
+            vars_found[var_name] = expr
+
+        # Find the RETURN expression
+        return_match = re.search(r'\bRETURN\s+(.+)$', sql, re.IGNORECASE | re.DOTALL)
+        if return_match:
+            result = return_match.group(1).strip()
+            # Inline all variables
+            for var_name, var_expr in vars_found.items():
+                result = re.sub(r'\b' + re.escape(var_name) + r'\b', f'({var_expr})', result)
+            self._transformations.append("var_return_inline")
+            return result
+
+        return sql
+
+    def _pass_time_intelligence(self, sql: str) -> str:
+        """Translate time intelligence functions."""
+        # TOTALYTD
+        m = re.search(r'\bTOTALYTD\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)', sql, re.IGNORECASE)
+        if m:
+            self._transformations.append("TOTALYTD_to_window")
+            self._warnings.append("TOTALYTD converted to window spec - verify date column")
+            inner = m.group(1).strip()
+            return inner
+
+        # TOTALMTD
+        m = re.search(r'\bTOTALMTD\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)', sql, re.IGNORECASE)
+        if m:
+            self._transformations.append("TOTALMTD_to_window")
+            inner = m.group(1).strip()
+            return inner
+
+        # TOTALQTD
+        m = re.search(r'\bTOTALQTD\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)', sql, re.IGNORECASE)
+        if m:
+            self._transformations.append("TOTALQTD_to_window")
+            inner = m.group(1).strip()
+            return inner
+
+        # SAMEPERIODLASTYEAR - flag for manual review
+        if re.search(r'\bSAMEPERIODLASTYEAR\b', sql, re.IGNORECASE):
+            self._warnings.append("SAMEPERIODLASTYEAR requires manual review for period comparison logic")
+            self._transformations.append("SAMEPERIODLASTYEAR_flagged")
+
+        # DATESINPERIOD
+        if re.search(r'\bDATESINPERIOD\b', sql, re.IGNORECASE):
+            self._warnings.append("DATESINPERIOD requires manual review")
+            self._transformations.append("DATESINPERIOD_flagged")
+
+        # PARALLELPERIOD
+        if re.search(r'\bPARALLELPERIOD\b', sql, re.IGNORECASE):
+            self._warnings.append("PARALLELPERIOD requires manual review")
+            self._transformations.append("PARALLELPERIOD_flagged")
+
+        return sql
+
+    def _extract_window_spec(self, dax_expr: str) -> Optional[dict]:
+        """Extract window specification from time intelligence DAX."""
+        if re.search(r'\bTOTALYTD\b', dax_expr, re.IGNORECASE):
+            # Find the date column
+            m = re.search(r'\bTOTALYTD\s*\(.+?,\s*(.+?)\)', dax_expr, re.IGNORECASE)
+            date_col = "date"
+            if m:
+                ref = m.group(1).strip().strip("'")
+                col_m = RE_TABLE_COL.search(ref)
+                if col_m:
+                    date_col = col_m.group(2).lower().replace(" ", "_")
+            return {"range": "cumulative", "order_by": date_col, "group_by": "year"}
+
+        if re.search(r'\bTOTALMTD\b', dax_expr, re.IGNORECASE):
+            return {"range": "cumulative", "order_by": "date", "group_by": "month"}
+
+        if re.search(r'\bTOTALQTD\b', dax_expr, re.IGNORECASE):
+            return {"range": "cumulative", "order_by": "date", "group_by": "quarter"}
+
+        return None
+
+    @staticmethod
+    def _find_balanced_paren(text: str, start: int) -> int:
+        """Return index of the closing ')' that balances the '(' at *start*.
+        Returns -1 if no balanced close is found."""
+        depth = 0
+        i = start
+        while i < len(text):
+            if text[i] == '(':
+                depth += 1
+            elif text[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    @staticmethod
+    def _split_top_level_args(text: str) -> List[str]:
+        """Split *text* on commas that are NOT inside nested parentheses."""
+        args: List[str] = []
+        depth = 0
+        current: List[str] = []
+        for ch in text:
+            if ch == '(':
+                depth += 1
+                current.append(ch)
+            elif ch == ')':
+                depth -= 1
+                current.append(ch)
+            elif ch == ',' and depth == 0:
+                args.append(''.join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        tail = ''.join(current).strip()
+        if tail:
+            args.append(tail)
+        return args
+
+    def _pass_calculate(self, sql: str, table_name: str) -> str:
+        """Translate CALCULATE with filter arguments to conditional aggregation.
+
+        Uses balanced-parenthesis parsing so nested calls like
+        CALCULATE(SUM(T[C]), FILTER(ALL(T), T[X] = 'V')) are handled correctly.
+        """
+        calc_re = re.compile(r'\bCALCULATE\s*\(', re.IGNORECASE)
+        result_parts: List[str] = []
+        pos = 0
+
+        while pos < len(sql):
+            m = calc_re.search(sql, pos)
+            if not m:
+                result_parts.append(sql[pos:])
+                break
+
+            # Emit text before CALCULATE
+            result_parts.append(sql[pos:m.start()])
+
+            # Find the balanced closing ')' for this CALCULATE(
+            open_idx = m.end() - 1  # index of the '('
+            close_idx = self._find_balanced_paren(sql, open_idx)
+            if close_idx == -1:
+                # Unbalanced - leave as-is
+                result_parts.append(sql[m.start():m.end()])
+                pos = m.end()
+                continue
+
+            inner = sql[open_idx + 1:close_idx]  # everything inside CALCULATE(...)
+            args = self._split_top_level_args(inner)
+
+            if len(args) >= 2:
+                measure_expr = args[0]
+                filter_expr = args[1]
+
+                # Handle FILTER(ALL(table), condition)
+                filter_all = re.match(
+                    r'FILTER\s*\(\s*ALL\s*\(\s*[\w\s]+\s*\)\s*,\s*(.+)\s*\)$',
+                    filter_expr, re.IGNORECASE | re.DOTALL
+                )
+                if filter_all:
+                    condition = filter_all.group(1).strip()
+                    condition = self._translate_table_col_refs(condition, table_name)
+                    self._transformations.append("CALCULATE_FILTER_ALL_to_CASE_WHEN")
+                    result_parts.append(f"CASE WHEN {condition} THEN {measure_expr} END")
+                    pos = close_idx + 1
+                    continue
+
+                # Simple column filter: Table[Col] = value
+                col_filter = RE_TABLE_COL.search(filter_expr)
+                if col_filter and '=' in filter_expr:
+                    condition = self._translate_table_col_refs(filter_expr, table_name)
+                    self._transformations.append("CALCULATE_simple_filter_to_CASE_WHEN")
+                    result_parts.append(f"CASE WHEN {condition} THEN {measure_expr} END")
+                    pos = close_idx + 1
+                    continue
+
+                # Complex CALCULATE - flag for review
+                self._issues.append(f"Complex CALCULATE pattern requires manual review: {filter_expr[:80]}")
+                self._transformations.append("CALCULATE_complex_flagged")
+
+            # Could not translate - keep original
+            result_parts.append(sql[m.start():close_idx + 1])
+            pos = close_idx + 1
+
+        return ''.join(result_parts)
+
+    def _pass_aggregations(self, sql: str, table_name: str) -> str:
+        """Translate DAX aggregation functions to SQL equivalents."""
+        # SUM(Table[Col])
+        sql = re.sub(
+            r'\bSUM\s*\(\s*\'?(\w[\w\s]*?)\'?\[(\w[\w\s]*?)\]\s*\)',
+            lambda m: f"SUM(source.{m.group(2).lower().replace(' ', '_')})",
+            sql, flags=re.IGNORECASE
+        )
+        if 'SUM(source.' in sql:
+            self._transformations.append("SUM_translation")
+
+        # COUNT(Table[Col])
+        sql = re.sub(
+            r'\bCOUNT\s*\(\s*\'?(\w[\w\s]*?)\'?\[(\w[\w\s]*?)\]\s*\)',
+            lambda m: f"COUNT(source.{m.group(2).lower().replace(' ', '_')})",
+            sql, flags=re.IGNORECASE
+        )
+        if 'COUNT(source.' in sql:
+            self._transformations.append("COUNT_translation")
+
+        # DISTINCTCOUNT(Table[Col])
+        sql = re.sub(
+            r'\bDISTINCTCOUNT\s*\(\s*\'?(\w[\w\s]*?)\'?\[(\w[\w\s]*?)\]\s*\)',
+            lambda m: f"COUNT(DISTINCT source.{m.group(2).lower().replace(' ', '_')})",
+            sql, flags=re.IGNORECASE
+        )
+        if 'COUNT(DISTINCT source.' in sql:
+            self._transformations.append("DISTINCTCOUNT_translation")
+
+        # AVERAGE(Table[Col])
+        sql = re.sub(
+            r'\bAVERAGE\s*\(\s*\'?(\w[\w\s]*?)\'?\[(\w[\w\s]*?)\]\s*\)',
+            lambda m: f"AVG(source.{m.group(2).lower().replace(' ', '_')})",
+            sql, flags=re.IGNORECASE
+        )
+        if 'AVG(source.' in sql:
+            self._transformations.append("AVERAGE_translation")
+
+        # MIN(Table[Col])
+        sql = re.sub(
+            r'\bMIN\s*\(\s*\'?(\w[\w\s]*?)\'?\[(\w[\w\s]*?)\]\s*\)',
+            lambda m: f"MIN(source.{m.group(2).lower().replace(' ', '_')})",
+            sql, flags=re.IGNORECASE
+        )
+
+        # MAX(Table[Col])
+        sql = re.sub(
+            r'\bMAX\s*\(\s*\'?(\w[\w\s]*?)\'?\[(\w[\w\s]*?)\]\s*\)',
+            lambda m: f"MAX(source.{m.group(2).lower().replace(' ', '_')})",
+            sql, flags=re.IGNORECASE
+        )
+
+        # COUNTROWS(Table)
+        sql = re.sub(
+            r'\bCOUNTROWS\s*\(\s*\'?(\w[\w\s]*?)\'?\s*\)',
+            'COUNT(*)',
+            sql, flags=re.IGNORECASE
+        )
+        if 'COUNT(*)' in sql:
+            self._transformations.append("COUNTROWS_translation")
+
+        # COUNTBLANK(Table[Col])
+        sql = re.sub(
+            r'\bCOUNTBLANK\s*\(\s*\'?(\w[\w\s]*?)\'?\[(\w[\w\s]*?)\]\s*\)',
+            lambda m: f"SUM(CASE WHEN source.{m.group(2).lower().replace(' ', '_')} IS NULL THEN 1 ELSE 0 END)",
+            sql, flags=re.IGNORECASE
+        )
+
+        # COUNTA(Table[Col])
+        sql = re.sub(
+            r'\bCOUNTA\s*\(\s*\'?(\w[\w\s]*?)\'?\[(\w[\w\s]*?)\]\s*\)',
+            lambda m: f"COUNT(source.{m.group(2).lower().replace(' ', '_')})",
+            sql, flags=re.IGNORECASE
+        )
+
+        return sql
+
+    def _pass_conditional(self, sql: str) -> str:
+        """Translate conditional logic functions."""
+        # DIVIDE(a, b, alt)
+        divide_pattern = re.compile(
+            r'\bDIVIDE\s*\(\s*(.+?)\s*,\s*(.+?)\s*,\s*(.+?)\s*\)',
+            re.IGNORECASE
+        )
+        if divide_pattern.search(sql):
+            sql = divide_pattern.sub(
+                lambda m: f"COALESCE(({m.group(1).strip()}) / NULLIF({m.group(2).strip()}, 0), {m.group(3).strip()})",
+                sql
+            )
+            self._transformations.append("DIVIDE_to_COALESCE_NULLIF")
+
+        # DIVIDE(a, b) without alt
+        divide2_pattern = re.compile(
+            r'\bDIVIDE\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)',
+            re.IGNORECASE
+        )
+        if divide2_pattern.search(sql):
+            sql = divide2_pattern.sub(
+                lambda m: f"COALESCE(({m.group(1).strip()}) / NULLIF({m.group(2).strip()}, 0), 0)",
+                sql
+            )
+            self._transformations.append("DIVIDE_2arg_to_COALESCE_NULLIF")
+
+        # IF(cond, true, false)
+        if_pattern = re.compile(
+            r'\bIF\s*\(\s*(.+?)\s*,\s*(.+?)\s*,\s*(.+?)\s*\)',
+            re.IGNORECASE
+        )
+        if if_pattern.search(sql):
+            sql = if_pattern.sub(
+                lambda m: f"CASE WHEN {m.group(1).strip()} THEN {m.group(2).strip()} ELSE {m.group(3).strip()} END",
+                sql
+            )
+            self._transformations.append("IF_to_CASE_WHEN")
+
+        # SWITCH(TRUE(), cond1, result1, cond2, result2, ..., default)
+        switch_true = re.compile(
+            r'\bSWITCH\s*\(\s*TRUE\s*\(\s*\)\s*,\s*(.+)\)',
+            re.IGNORECASE | re.DOTALL
+        )
+        m = switch_true.search(sql)
+        if m:
+            args_str = m.group(1)
+            args = self._split_args(args_str)
+            case_parts = ["CASE"]
+            i = 0
+            while i < len(args) - 1:
+                case_parts.append(f" WHEN {args[i].strip()} THEN {args[i+1].strip()}")
+                i += 2
+            if len(args) % 2 == 1:
+                case_parts.append(f" ELSE {args[-1].strip()}")
+            case_parts.append(" END")
+            sql = sql[:m.start()] + "".join(case_parts) + sql[m.end():]
+            self._transformations.append("SWITCH_TRUE_to_CASE_WHEN")
+
+        # SWITCH(expr, val1, result1, ..., default)
+        switch_pattern = re.compile(
+            r'\bSWITCH\s*\(\s*(.+?)\s*,\s*(.+)\)',
+            re.IGNORECASE | re.DOTALL
+        )
+        m = switch_pattern.search(sql)
+        if m and 'CASE' not in sql:  # Don't double-translate
+            switch_expr = m.group(1).strip()
+            args_str = m.group(2)
+            args = self._split_args(args_str)
+            case_parts = [f"CASE {switch_expr}"]
+            i = 0
+            while i < len(args) - 1:
+                case_parts.append(f" WHEN {args[i].strip()} THEN {args[i+1].strip()}")
+                i += 2
+            if len(args) % 2 == 1:
+                case_parts.append(f" ELSE {args[-1].strip()}")
+            case_parts.append(" END")
+            sql = sql[:m.start()] + "".join(case_parts) + sql[m.end():]
+            self._transformations.append("SWITCH_to_CASE")
+
+        # ISBLANK(expr) -> (expr IS NULL)
+        sql = re.sub(
+            r'\bISBLANK\s*\(\s*(.+?)\s*\)',
+            lambda m: f"({m.group(1).strip()} IS NULL)",
+            sql, flags=re.IGNORECASE
+        )
+        if 'IS NULL' in sql and 'ISBLANK' not in sql:
+            self._transformations.append("ISBLANK_to_IS_NULL")
+
+        # IFERROR(expr, alt) -> COALESCE(TRY(expr), alt)
+        sql = re.sub(
+            r'\bIFERROR\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)',
+            lambda m: f"COALESCE(TRY({m.group(1).strip()}), {m.group(2).strip()})",
+            sql, flags=re.IGNORECASE
+        )
+        if 'TRY(' in sql:
+            self._transformations.append("IFERROR_to_TRY")
+
+        return sql
+
+    def _pass_logical(self, sql: str) -> str:
+        """Translate logical operators."""
+        # AND(a, b)
+        sql = re.sub(
+            r'\bAND\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)',
+            lambda m: f"({m.group(1).strip()} AND {m.group(2).strip()})",
+            sql, flags=re.IGNORECASE
+        )
+
+        # OR(a, b)
+        sql = re.sub(
+            r'\bOR\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)',
+            lambda m: f"({m.group(1).strip()} OR {m.group(2).strip()})",
+            sql, flags=re.IGNORECASE
+        )
+
+        # NOT(expr)
+        sql = re.sub(
+            r'\bNOT\s*\(\s*(.+?)\s*\)',
+            lambda m: f"NOT({m.group(1).strip()})",
+            sql, flags=re.IGNORECASE
+        )
+
+        # && -> AND, || -> OR
+        if '&&' in sql:
+            sql = RE_AND_OP.sub(' AND ', sql)
+            self._transformations.append("logical_AND_operator")
+        if '||' in sql:
+            sql = RE_OR_OP.sub(' OR ', sql)
+            self._transformations.append("logical_OR_operator")
+
+        return sql
+
+    def _pass_date_functions(self, sql: str) -> str:
+        """Translate DAX date functions to Databricks SQL."""
+        # TODAY() -> CURRENT_DATE()
+        sql = re.sub(r'\bTODAY\s*\(\s*\)', 'CURRENT_DATE()', sql, flags=re.IGNORECASE)
+        if 'CURRENT_DATE()' in sql:
+            self._transformations.append("TODAY_to_CURRENT_DATE")
+
+        # EOMONTH(date, offset) -> LAST_DAY(ADD_MONTHS(date, offset))
+        sql = re.sub(
+            r'\bEOMONTH\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)',
+            lambda m: f"LAST_DAY(ADD_MONTHS({m.group(1).strip()}, {m.group(2).strip()}))",
+            sql, flags=re.IGNORECASE
+        )
+
+        # EDATE(date, offset) -> ADD_MONTHS(date, offset)
+        sql = re.sub(
+            r'\bEDATE\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)',
+            lambda m: f"ADD_MONTHS({m.group(1).strip()}, {m.group(2).strip()})",
+            sql, flags=re.IGNORECASE
+        )
+
+        # DATEDIFF(start, end, unit) -> DATEDIFF(unit, start, end) [param swap]
+        datediff_m = re.search(
+            r'\bDATEDIFF\s*\(\s*(.+?)\s*,\s*(.+?)\s*,\s*(\w+)\s*\)',
+            sql, flags=re.IGNORECASE
+        )
+        if datediff_m:
+            start = datediff_m.group(1).strip()
+            end = datediff_m.group(2).strip()
+            unit = datediff_m.group(3).strip().upper()
+            unit_map = {"DAY": "DAY", "MONTH": "MONTH", "YEAR": "YEAR",
+                        "WEEK": "WEEK", "QUARTER": "QUARTER", "HOUR": "HOUR",
+                        "MINUTE": "MINUTE", "SECOND": "SECOND"}
+            sql_unit = unit_map.get(unit, "DAY")
+            sql = sql[:datediff_m.start()] + f"DATEDIFF({sql_unit}, {start}, {end})" + sql[datediff_m.end():]
+            self._transformations.append("DATEDIFF_param_reorder")
+
+        # DATEADD(dateCol, offset, unit) -> DATE_ADD / ADD_MONTHS
+        dateadd_m = re.search(
+            r'\bDATEADD\s*\(\s*(.+?)\s*,\s*(-?\d+)\s*,\s*(\w+)\s*\)',
+            sql, flags=re.IGNORECASE
+        )
+        if dateadd_m:
+            date_col = dateadd_m.group(1).strip()
+            offset = dateadd_m.group(2)
+            unit = dateadd_m.group(3).strip().upper()
+            if unit in ("MONTH", "QUARTER", "YEAR"):
+                multiplier = {"MONTH": 1, "QUARTER": 3, "YEAR": 12}.get(unit, 1)
+                total = int(offset) * multiplier
+                replacement = f"ADD_MONTHS({date_col}, {total})"
+            else:
+                replacement = f"DATE_ADD({date_col}, {offset})"
+            sql = sql[:dateadd_m.start()] + replacement + sql[dateadd_m.end():]
+            self._transformations.append("DATEADD_translation")
+
+        return sql
+
+    def _pass_text_functions(self, sql: str) -> str:
+        """Translate DAX text functions."""
+        # CONCATENATE(a, b) -> CONCAT(a, b)
+        sql = re.sub(
+            r'\bCONCATENATE\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)',
+            lambda m: f"CONCAT({m.group(1).strip()}, {m.group(2).strip()})",
+            sql, flags=re.IGNORECASE
+        )
+        if 'CONCAT(' in sql:
+            self._transformations.append("CONCATENATE_to_CONCAT")
+
+        # CONTAINSSTRING(str, substr) -> (str LIKE '%' || substr || '%')
+        sql = re.sub(
+            r'\bCONTAINSSTRING\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)',
+            lambda m: f"({m.group(1).strip()} LIKE CONCAT('%%', {m.group(2).strip()}, '%%'))",
+            sql, flags=re.IGNORECASE
+        )
+
+        # FORMAT - common date patterns
+        format_m = re.search(
+            r'\bFORMAT\s*\(\s*(.+?)\s*,\s*"(.+?)"\s*\)',
+            sql, flags=re.IGNORECASE
+        )
+        if format_m:
+            expr = format_m.group(1).strip()
+            fmt = format_m.group(2)
+            # Map common DAX format strings to Databricks
+            fmt_map = {
+                "yyyy": "yyyy", "mm": "MM", "dd": "dd",
+                "yyyy-mm-dd": "yyyy-MM-dd",
+                "mm/dd/yyyy": "MM/dd/yyyy",
+                "#,##0": "#,##0",
+                "#,##0.00": "#,##0.00",
+                "0%": "0%",
+                "0.00%": "0.00%",
+            }
+            db_fmt = fmt_map.get(fmt.lower(), fmt)
+            sql = sql[:format_m.start()] + f"DATE_FORMAT({expr}, '{db_fmt}')" + sql[format_m.end():]
+            self._transformations.append("FORMAT_translation")
+
+        return sql
+
+    def _pass_lookups(self, sql: str, table_name: str) -> str:
+        """Translate lookup functions (RELATED, SELECTEDVALUE)."""
+        # RELATED(DimTable[Col]) -> join_alias.col
+        def resolve_related(match):
+            full = match.group(0)
+            inner = match.group(1).strip()
+            col_m = RE_TABLE_COL.search(inner)
+            if col_m:
+                tbl = col_m.group(1).strip("'").lower().replace(" ", "_")
+                col = col_m.group(2).lower().replace(" ", "_")
+                self._transformations.append("RELATED_to_join_ref")
+                return f"{tbl}.{col}"
+            return full
+
+        sql = re.sub(
+            r'\bRELATED\s*\(\s*(.+?)\s*\)',
+            resolve_related,
+            sql, flags=re.IGNORECASE
+        )
+
+        # SELECTEDVALUE(Table[Col], alt)
+        sql = re.sub(
+            r'\bSELECTEDVALUE\s*\(\s*\'?(\w[\w\s]*?)\'?\[(\w[\w\s]*?)\]\s*(?:,\s*(.+?))?\s*\)',
+            lambda m: (
+                f"COALESCE(source.{m.group(2).lower().replace(' ', '_')}, {m.group(3).strip()})"
+                if m.group(3) else f"source.{m.group(2).lower().replace(' ', '_')}"
+            ),
+            sql, flags=re.IGNORECASE
+        )
+
+        # HASONEVALUE(Table[Col]) -> simplified
+        sql = re.sub(
+            r'\bHASONEVALUE\s*\(\s*\'?(\w[\w\s]*?)\'?\[(\w[\w\s]*?)\]\s*\)',
+            lambda m: f"(COUNT(DISTINCT source.{m.group(2).lower().replace(' ', '_')}) = 1)",
+            sql, flags=re.IGNORECASE
+        )
+
+        return sql
+
+    def _pass_iterators(self, sql: str, table_name: str) -> str:
+        """Translate iterator functions (SUMX, COUNTX, AVERAGEX)."""
+        # SUMX(table, expr) -> SUM(expr) for simple cases
+        sql = re.sub(
+            r'\bSUMX\s*\(\s*\'?(\w[\w\s]*?)\'?\s*,\s*(.+?)\s*\)',
+            lambda m: f"SUM({m.group(2).strip()})",
+            sql, flags=re.IGNORECASE
+        )
+        if re.search(r'\bSUM\(', sql) and 'SUMX' not in sql:
+            self._transformations.append("SUMX_to_SUM")
+
+        # COUNTX
+        sql = re.sub(
+            r'\bCOUNTX\s*\(\s*\'?(\w[\w\s]*?)\'?\s*,\s*(.+?)\s*\)',
+            lambda m: f"COUNT({m.group(2).strip()})",
+            sql, flags=re.IGNORECASE
+        )
+
+        # AVERAGEX
+        sql = re.sub(
+            r'\bAVERAGEX\s*\(\s*\'?(\w[\w\s]*?)\'?\s*,\s*(.+?)\s*\)',
+            lambda m: f"AVG({m.group(2).strip()})",
+            sql, flags=re.IGNORECASE
+        )
+
+        return sql
+
+    def _pass_table_col_refs(self, sql: str, table_name: str) -> str:
+        """Translate remaining Table[Column] references to source.column."""
+        sql = self._translate_table_col_refs(sql, table_name)
+        return sql
+
+    def _translate_table_col_refs(self, sql: str, table_name: str) -> str:
+        """Replace Table[Column] patterns with source.col or join.col."""
+        def replace_ref(match):
+            tbl = match.group(1).strip("'").lower().replace(" ", "_")
+            col = match.group(2).lower().replace(" ", "_")
+            fact_lower = table_name.lower().replace(" ", "_") if table_name else ""
+
+            # If it's the fact table, use source.col
+            if tbl == fact_lower or not fact_lower:
+                return f"source.{col}"
+
+            # Check join map
+            key = f"{match.group(1).strip(chr(39))}.{match.group(2)}".lower()
+            if key in self._join_map:
+                return self._join_map[key]
+
+            # Default: use table alias
+            return f"{tbl}.{col}"
+
+        result = RE_TABLE_COL.sub(replace_ref, sql)
+        if result != sql:
+            self._transformations.append("table_column_refs")
+        return result
+
+    def _pass_measure_refs(self, sql: str) -> str:
+        """Translate [Measure Name] references to MEASURE(`slug`)."""
+        def replace_measure(match):
+            name = match.group(1)
+            # Check if this measure has been resolved
+            if name in self._known_measures:
+                self._transformations.append(f"measure_ref_{name}")
+                return f"MEASURE(`{name}`)"
+            # Still reference it as MEASURE() for composition
+            return f"MEASURE(`{name}`)"
+
+        # Only replace [Name] patterns that look like measure refs
+        # (not already inside source.xxx or alias.xxx)
+        result = re.sub(r'(?<!source\.)(?<!\.)\[([^\]]+)\]', replace_measure, sql)
+        if result != sql:
+            self._transformations.append("measure_refs")
+        return result
+
+    def _pass_cleanup(self, sql: str) -> str:
+        """Final cleanup pass."""
+        # Remove double spaces
+        sql = re.sub(r'\s+', ' ', sql).strip()
+        # Fix double parens
+        sql = re.sub(r'\(\(([^()]+)\)\)', r'(\1)', sql)
+        return sql
+
+    def _compute_status(self, sql: str, original: str) -> Tuple[str, int]:
+        """Compute translation status and confidence score."""
+        # Check for residual DAX patterns
+        residual_dax = []
+        dax_funcs = ['CALCULATE', 'CALCULATETABLE', 'ADDCOLUMNS', 'SELECTCOLUMNS',
+                      'EARLIER', 'EARLIEST', 'VALUES', 'ALLEXCEPT', 'RELATEDTABLE']
+        for func in dax_funcs:
+            if re.search(rf'\b{func}\s*\(', sql, re.IGNORECASE):
+                residual_dax.append(func)
+
+        # Check for remaining Table[Col] refs
+        if RE_TABLE_COL.search(sql):
+            residual_dax.append("Table[Column]")
+
+        if residual_dax:
+            self._issues.append(f"Residual DAX patterns: {', '.join(residual_dax)}")
+
+        # Compute confidence
+        confidence = 100
+        confidence -= len(self._issues) * 20
+        confidence -= len(self._warnings) * 5
+        if residual_dax:
+            confidence -= len(residual_dax) * 15
+
+        confidence = max(0, min(100, confidence))
+
+        # Determine status
+        if self._issues and confidence < 30:
+            return "unsupported", confidence
+        elif self._issues or confidence < 70:
+            return "partial", confidence
+        else:
+            return "converted", confidence
+
+    def _split_args(self, args_str: str) -> List[str]:
+        """Split a comma-separated argument string respecting nested parens."""
+        args = []
+        depth = 0
+        current = []
+        for ch in args_str:
+            if ch == '(':
+                depth += 1
+                current.append(ch)
+            elif ch == ')':
+                depth -= 1
+                current.append(ch)
+            elif ch == ',' and depth == 0:
+                args.append(''.join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        if current:
+            args.append(''.join(current).strip())
+        return args
