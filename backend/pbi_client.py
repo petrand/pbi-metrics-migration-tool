@@ -806,6 +806,30 @@ class PowerBIClient:
             f"Scanner API scan {scan_id} did not complete within {max_wait}s."
         )
 
+    # ── Report Layout Extraction ──────────────────────────────────────
+    def list_reports(self, workspace_id: str) -> list:
+        """List reports in a workspace."""
+        url = f"{_PBI_BASE}/groups/{workspace_id}/reports"
+        resp = self._get(url)
+        reports = resp.get("value", [])
+        return [{"id": r["id"], "name": r["name"],
+                 "datasetId": r.get("datasetId", "")} for r in reports]
+
+    def get_report_pages(self, report_id: str, workspace_id: str = "") -> list:
+        """Get pages of a report."""
+        base = f"{_PBI_BASE}/groups/{workspace_id}" if workspace_id else _PBI_BASE
+        url = f"{base}/reports/{report_id}/pages"
+        resp = self._get(url)
+        return resp.get("value", [])
+
+    def get_page_visuals(self, report_id: str, page_name: str,
+                          workspace_id: str = "") -> list:
+        """Get visuals on a specific report page."""
+        base = f"{_PBI_BASE}/groups/{workspace_id}" if workspace_id else _PBI_BASE
+        url = f"{base}/reports/{report_id}/pages/{page_name}/visuals"
+        resp = self._get(url)
+        return resp.get("value", [])
+
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------

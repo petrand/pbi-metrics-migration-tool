@@ -17,6 +17,8 @@ from backend.evaluator import EvaluationReporter, MeasureEvaluation
 from backend.overrides import Overrides, OverridesManager
 from backend.validator import MetricViewValidator
 from backend.yaml_generator import MetricViewYAMLGenerator
+from backend.dashboard_generator import DashboardGenerator
+from backend.lakeview_client import LakeviewClient
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,8 @@ class MigrationConfig:
     dry_run: bool = False
     validate_only: bool = False
     overrides: Optional[Overrides] = None
+    generate_dashboard: bool = False
+    dashboard_name: str = ""
 
 
 @dataclass
@@ -63,6 +67,9 @@ class MigrationResult:
     completed_at: str = ""
     duration_ms: int = 0
     errors: List[str] = field(default_factory=list)
+    dashboard_id: str = ""
+    dashboard_url: str = ""
+    dashboard_spec: Optional[dict] = None
 
     def to_dict(self) -> dict:
         return {
@@ -81,6 +88,8 @@ class MigrationResult:
             "completed_at": self.completed_at,
             "duration_ms": self.duration_ms,
             "errors": self.errors,
+            "dashboard_id": self.dashboard_id,
+            "dashboard_url": self.dashboard_url,
         }
 
 
@@ -313,6 +322,49 @@ class MigrationPipeline:
                 result.errors.append(f"Deployment error: {e}")
         else:
             self._notify("complete", 100, "Pipeline complete (no deployment)")
+
+        # ── Step 7a: Generate Dashboard (optional) ──
+        if config.generate_dashboard and dbx_client:
+            step = self._start_step("dashboard")
+            result.steps.append(step)
+            try:
+                dash_gen = DashboardGenerator()
+                # Build metric view spec list from generated YAML
+                mv_specs = []
+                for fg in result.fact_groups:
+                    fg_name = fg.get("name", "") if isinstance(fg, dict) else str(fg)
+                    mv_specs.append({
+                        "fact_group": fg_name,
+                        "yaml": result.generated_yaml.get(fg_name, ""),
+                        "sql": result.generated_sql.get(fg_name, ""),
+                    })
+                spec = dash_gen.generate_from_metric_views(
+                    metric_view_specs=mv_specs,
+                    model_name=result.model_name,
+                    catalog=config.catalog,
+                    schema=config.schema,
+                )
+                result.dashboard_spec = spec.to_dict()
+
+                if not config.dry_run:
+                    lv_client = LakeviewClient(dbx_client)
+                    dash_name = config.dashboard_name or f"{result.model_name} Dashboard"
+                    dash = lv_client.deploy_dashboard(
+                        display_name=dash_name,
+                        serialized_dashboard=spec.to_json(),
+                        warehouse_id=config.warehouse_id,
+                        publish=True,
+                    )
+                    result.dashboard_id = dash.dashboard_id
+                    result.dashboard_url = dash.published_url or lv_client.get_published_url(dash.dashboard_id)
+                    self._complete_step(step, f"Dashboard deployed: {result.dashboard_url}")
+                else:
+                    self._complete_step(step, "Dashboard spec generated (dry run)")
+                self._notify("dashboard", 95, "Dashboard ready")
+            except Exception as e:
+                self._fail_step(step, str(e))
+                result.errors.append(f"Dashboard generation failed: {e}")
+                logger.warning("Dashboard step failed: %s", e)
 
         # Finalize
         result.completed_at = datetime.now(timezone.utc).isoformat()

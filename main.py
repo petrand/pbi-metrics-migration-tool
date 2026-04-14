@@ -469,6 +469,8 @@ def run_migration(body: dict = {}):
         deploy=body.get("deploy", False),
         dry_run=body.get("dry_run", False),
         validate_only=body.get("validate_only", False),
+        generate_dashboard=body.get("generate_dashboard", False),
+        dashboard_name=body.get("dashboard_name", ""),
     )
 
     # Load overrides if provided
@@ -499,6 +501,54 @@ def migration_report(migration_id: str):
     if not result:
         raise HTTPException(404, "Migration not found")
     return result.to_dict()
+
+
+# ── Dashboard Endpoints ──────────────────────────────────────────────
+@app.post("/api/dashboard/generate")
+def dashboard_generate(body: dict = {}):
+    """Generate a Lakeview dashboard spec from metric view data."""
+    from backend.dashboard_generator import DashboardGenerator
+    catalog = body.get("catalog", "main")
+    schema = body.get("schema", "default")
+    model_name = body.get("model_name", "Migration")
+    mv_specs = body.get("metric_view_specs", [])
+    if not mv_specs and _state.get("model"):
+        # Auto-build from current model state
+        mv_specs = [{"fact_group": "default", "yaml": "", "sql": ""}]
+    gen = DashboardGenerator()
+    spec = gen.generate_from_metric_views(mv_specs, model_name, catalog, schema)
+    return spec.to_dict()
+
+@app.post("/api/dashboard/deploy")
+def dashboard_deploy(body: dict = {}):
+    """Deploy a Lakeview dashboard to Databricks."""
+    from backend.lakeview_client import LakeviewClient
+    dbx = _state.get("dbx_client")
+    if not dbx:
+        raise HTTPException(400, "Not connected to Databricks")
+    spec_json = body.get("serialized_dashboard", "")
+    display_name = body.get("display_name", "PBI Migration Dashboard")
+    warehouse_id = body.get("warehouse_id", _state.get("warehouse_id", ""))
+    if not spec_json:
+        raise HTTPException(400, "serialized_dashboard required")
+    lv = LakeviewClient(dbx)
+    result = lv.deploy_dashboard(
+        display_name=display_name,
+        serialized_dashboard=spec_json,
+        warehouse_id=warehouse_id,
+        publish=body.get("publish", True),
+    )
+    return result.to_dict()
+
+@app.get("/api/dashboard/{dashboard_id}")
+def dashboard_get(dashboard_id: str):
+    """Get dashboard info."""
+    from backend.lakeview_client import LakeviewClient
+    dbx = _state.get("dbx_client")
+    if not dbx:
+        raise HTTPException(400, "Not connected to Databricks")
+    lv = LakeviewClient(dbx)
+    return lv.get_dashboard(dashboard_id).to_dict()
 
 
 # ══════════════════════════════════════════════════════════════════
