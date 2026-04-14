@@ -1,11 +1,11 @@
-# Power BI to Databricks Metric View Migration Tool
+# Power BI to Databricks Metric View & AI/BI Dashboard Migration Tool
 
 ![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue?logo=python)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688?logo=fastapi)
 ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react)
-![Databricks](https://img.shields.io/badge/Databricks-Metric%20Views-FF3621?logo=databricks)
+![Databricks](https://img.shields.io/badge/Databricks-Metric%20Views%20%2B%20AI%2FBI-FF3621?logo=databricks)
 
-Automate the translation of Power BI semantic models (measures, dimensions, relationships) into Databricks [Metric Views](https://docs.databricks.com/aws/en/metric-views/index.html) — enabling governed, reusable analytics defined once and consumed everywhere.
+Automate the translation of Power BI semantic models (measures, dimensions, relationships) into Databricks [Metric Views](https://docs.databricks.com/aws/en/metric-views/index.html) and [AI/BI Dashboards](https://docs.databricks.com/aws/en/dashboards/index.html) — enabling governed, reusable analytics defined once and consumed everywhere.
 
 **Live App:** https://pbi-metrics-migration-1602460480284688.aws.databricksapps.com
 
@@ -21,6 +21,7 @@ Power BI models encode a large amount of business logic in DAX measures and tabu
 4. **Evaluates** translation quality with per-measure confidence scores and audit reports
 5. **Generates** Databricks Metric View DDL (YAML + SQL)
 6. **Deploys** the metric views to your Databricks workspace via Statement Execution API
+7. **Generates AI/BI Dashboards** — auto-creates Lakeview dashboards with counters, bar charts, and tables from the migrated metric views
 
 **Who it is for:** Data engineers and analytics engineers migrating Power BI workloads to the Databricks Lakehouse.
 
@@ -29,23 +30,22 @@ Power BI models encode a large amount of business logic in DAX measures and tabu
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          Migration Pipeline (7 Steps)                       │
-│                                                                             │
-│  ┌──────────┐  ┌───────────┐  ┌───────────┐  ┌──────────┐  ┌───────────┐  │
-│  │ EXTRACT  │─▶│ OVERRIDES │─▶│ TRANSLATE │─▶│ GENERATE │─▶│ VALIDATE  │  │
-│  │          │  │           │  │           │  │          │  │           │  │
-│  │ PBI API  │  │ Table/col │  │ DAX → SQL │  │ Metric   │  │ YAML+SQL  │  │
-│  │ TMDL     │  │ mappings  │  │ 14-pass   │  │ View DDL │  │ + circ.   │  │
-│  │ Samples  │  │ exclusions│  │ 30+ funcs │  │ YAML 1.1 │  │ ref check │  │
-│  └──────────┘  └───────────┘  └───────────┘  └──────────┘  └─────┬─────┘  │
-│                                                                    │        │
-│                                           ┌──────────┐    ┌───────▼──────┐ │
-│                                           │  DEPLOY  │◀───│  EVALUATE    │ │
-│                                           │ Statement│    │  Per-measure │ │
-│                                           │ Exec API │    │  confidence  │ │
-│                                           └──────────┘    └──────────────┘ │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│                       Migration Pipeline (7 Steps + Dashboard)                     │
+│                                                                                   │
+│  ┌──────────┐  ┌───────────┐  ┌───────────┐  ┌──────────┐  ┌───────────┐         │
+│  │ EXTRACT  │─▶│ OVERRIDES │─▶│ TRANSLATE │─▶│ GENERATE │─▶│ VALIDATE  │         │
+│  │ PBI API  │  │ table/col │  │ DAX → SQL │  │ Metric   │  │ YAML+SQL  │         │
+│  │ TMDL     │  │ mappings  │  │ 14-pass   │  │ View DDL │  │ circ. ref │         │
+│  │ Samples  │  │ exclusions│  │ 30+ funcs │  │ YAML 1.1 │  │ detection │         │
+│  └──────────┘  └───────────┘  └───────────┘  └──────────┘  └─────┬─────┘         │
+│                                                                    │               │
+│           ┌──────────────┐    ┌──────────┐    ┌───────────────────▼─────────────┐ │
+│           │  DASHBOARD   │◀───│  DEPLOY  │◀───│         EVALUATE               │ │
+│           │  Lakeview    │    │ Statement│    │  Per-measure confidence scores  │ │
+│           │  AI/BI       │    │ Exec API │    │  Audit reports & manifests     │ │
+│           └──────────────┘    └──────────┘    └────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -61,6 +61,8 @@ Power BI models encode a large amount of business logic in DAX measures and tabu
 - **Evaluation & audit reports** — per-measure confidence scores, fact-group conversion rates, pipeline summary
 - **YAML v1.1 validation** — structure, SQL expression, circular reference detection, residual DAX detection
 - **Databricks deployment** — pushes metric view DDL via Statement Execution API with rollback support
+- **AI/BI Dashboard generation** — auto-creates Lakeview dashboards from migrated metric views using the Dashboard API (`POST /api/2.0/lakeview/dashboards`), with auto-layout (counters, bar charts, tables), `MEASURE()` query syntax, and publish support
+- **PBI report layout extraction** — extracts report pages, visuals, chart types, and field bindings for dashboard-to-dashboard migration
 - **React UI** — step-by-step wizard with glass morphism design, Framer Motion animations, drag-drop TMDL upload
 
 ---
@@ -88,11 +90,13 @@ uvicorn main:app --port 8000
 open http://localhost:8000
 ```
 
-> **Tip:** Set `DATABRICKS_HOST` and `DATABRICKS_TOKEN` (or use `--profile` with the Databricks CLI) before deploying metric views.
+> **Tip:** Set `DATABRICKS_HOST` and `DATABRICKS_TOKEN` (or use `--profile` with the Databricks CLI) before deploying metric views or dashboards.
 
 ---
 
 ## API Reference
+
+### Core Endpoints
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -106,6 +110,11 @@ open http://localhost:8000
 | `GET` | `/api/samples/{id}` | Load a sample model by ID |
 | `POST` | `/api/translate` | Translate a single DAX expression to SQL |
 | `POST` | `/api/translate/batch` | Batch translate multiple DAX expressions |
+
+### Databricks Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
 | `POST` | `/api/dbx/auth` | Authenticate with Databricks workspace |
 | `GET` | `/api/dbx/warehouses` | List SQL warehouses |
 | `GET` | `/api/dbx/catalogs` | List Unity Catalog catalogs |
@@ -113,27 +122,101 @@ open http://localhost:8000
 | `POST` | `/api/dbx/validate` | Validate metric view YAML or DDL |
 | `POST` | `/api/dbx/deploy` | Deploy metric view to Databricks |
 | `POST` | `/api/dbx/rollback` | Roll back a deployed view |
-| `POST` | `/api/migrate` | Run full migration pipeline |
+
+### Migration Pipeline
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/migrate` | Run full migration pipeline (pass `generate_dashboard: true` for dashboard) |
 | `GET` | `/api/migrate/{id}/status` | Poll migration status |
 | `GET` | `/api/migrate/{id}/report` | Get evaluation report |
+
+### AI/BI Dashboard Endpoints (NEW)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/dashboard/generate` | Generate Lakeview dashboard spec from metric view data |
+| `POST` | `/api/dashboard/deploy` | Deploy a Lakeview dashboard to Databricks |
+| `GET` | `/api/dashboard/{dashboard_id}` | Get dashboard info |
 
 All request/response bodies are JSON.
 
 ---
 
-## Backend Modules
+## Backend Modules (12 production Python files)
 
 | Module | Purpose |
 |--------|---------|
 | `backend/dax_translator.py` | 14-pass DAX-to-SQL engine, 30+ functions, balanced-paren CALCULATE |
-| `backend/pbi_client.py` | Power BI REST API client with MSAL OAuth2 + Scanner API fallback |
+| `backend/pbi_client.py` | Power BI REST API client with MSAL OAuth2 + Scanner API + report layout extraction |
 | `backend/tmdl_parser.py` | TMDL/BIM ZIP parser for offline semantic model extraction |
 | `backend/dbx_client.py` | Databricks Statement Execution + Unity Catalog API client |
 | `backend/yaml_generator.py` | Metric View YAML v1.1 + DDL generation |
 | `backend/validator.py` | YAML, SQL, DDL, circular-reference, residual-DAX validation |
 | `backend/evaluator.py` | Per-measure/fact-group/pipeline evaluation and audit reports |
 | `backend/overrides.py` | Table/column mappings, exclusions, join overrides, measure overrides |
-| `backend/pipeline.py` | 7-step migration orchestrator with progress callbacks |
+| `backend/pipeline.py` | 7-step migration orchestrator + optional dashboard generation step |
+| `backend/report_parser.py` | **NEW** — PBI report layout extraction (REST API + PBIX ZIP), visual type mapping |
+| `backend/dashboard_generator.py` | **NEW** — Lakeview dashboard JSON spec builder with auto-layout |
+| `backend/lakeview_client.py` | **NEW** — Databricks Lakeview Dashboard API client (create, publish, update, delete) |
+
+---
+
+## AI/BI Dashboard Generation
+
+The tool can auto-generate Lakeview AI/BI dashboards from your migrated metric views.
+
+### How it works
+
+1. After metric views are generated, the `DashboardGenerator` builds a Lakeview dashboard spec
+2. Each metric view becomes a dataset using `MEASURE()` query syntax
+3. Auto-layout places widgets on a 6-column grid:
+   - **Row 0:** Counter widgets (one per measure, width=1)
+   - **Rows 2+:** Bar charts (one per measure x first dimension, width=3)
+   - **Final row:** Full-width table with all dimensions and measures
+4. The spec is deployed via `POST /api/2.0/lakeview/dashboards` and published
+
+### PBI Visual → Lakeview Widget Mapping
+
+| Power BI Visual | Lakeview Widget |
+|---|---|
+| barChart / columnChart | bar |
+| lineChart | line |
+| areaChart | area |
+| pieChart / donutChart | pie |
+| card / kpiVisual | counter |
+| tableEx / matrix | table |
+| scatterChart | scatter |
+
+### Example: Auto-generated Dashboard Layout
+
+```
+┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐
+│ Total   │ Customer│         │         │         │         │  Row 0: Counters
+│ Revenue │  Count  │         │         │         │         │
+├─────────┴────┬────┴─────────┴────┬────┴─────────┴─────────┤
+│ Revenue by   │ Customers by     │                         │  Row 2: Bar Charts
+│ Region       │ Region           │                         │
+│ ████████     │ ███████          │                         │
+├──────────────┴──────────────────┴─────────────────────────┤
+│ Fact Summary Table (all dimensions + measures)            │  Row 6: Table
+│ Region | Year | Revenue | Customers                       │
+└───────────────────────────────────────────────────────────┘
+```
+
+### Usage via API
+
+```bash
+# Generate dashboard spec
+curl -X POST http://localhost:8000/api/dashboard/generate \
+  -H "Content-Type: application/json" \
+  -d '{"model_name":"Sales","catalog":"main","schema":"gold","metric_view_specs":[...]}'
+
+# Or include in migration pipeline
+curl -X POST http://localhost:8000/api/migrate \
+  -H "Content-Type: application/json" \
+  -d '{"sample_id":"sales","catalog":"main","schema":"gold","generate_dashboard":true}'
+```
 
 ---
 
@@ -186,7 +269,7 @@ See `overrides.example.yaml` for a fully annotated template.
 
 ## Testing
 
-### Run all 198 tests
+### Run all 276 tests
 
 ```bash
 pytest tests/ -v
@@ -197,10 +280,13 @@ pytest tests/ -v
 | File | Tests | Coverage |
 |------|-------|----------|
 | `tests/test_dax_translator.py` | 52 | DAX-to-SQL translation for 30+ patterns |
-| `tests/test_validator.py` | 37 | YAML structure, SQL, DDL, circular refs, residual DAX |
 | `tests/test_evaluator.py` | 54 | Measure/fact-group/pipeline evaluation, manifest, serialization |
 | `tests/test_overrides.py` | 42 | Table/column mappings, exclusions, joins, measure overrides |
+| `tests/test_validator.py` | 37 | YAML structure, SQL, DDL, circular refs, residual DAX |
 | `tests/test_api.py` | 33 | FastAPI endpoints: health, samples, translate, validate, migrate |
+| `tests/test_report_parser.py` | 37 | PBI report layout parsing, visual types, position normalization |
+| `tests/test_dashboard_generator.py` | 26 | Lakeview spec generation, auto-layout, MEASURE() queries |
+| `tests/test_lakeview_client.py` | 15 | Dashboard API client, URL construction, dataclass serialization |
 
 ### Frontend dev server
 
