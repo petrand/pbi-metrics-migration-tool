@@ -247,7 +247,7 @@ def test_calculate_simple_filter_produces_filter_where():
     assert "FILTER (WHERE" in result.translated_sql
     assert "SUM(source.salesamount)" in result.translated_sql
     assert "source.region = 'West'" in result.translated_sql
-    assert "CALCULATE_simple_filter_to_FILTER_WHERE" in result.applied_transformations
+    assert "CALCULATE_filter_to_FILTER_WHERE" in result.applied_transformations
 
 
 def test_calculate_filter_all_produces_filter_where():
@@ -257,7 +257,7 @@ def test_calculate_filter_all_produces_filter_where():
         "FactSales",
     )
     assert "FILTER (WHERE" in result.translated_sql
-    assert "CALCULATE_FILTER_ALL_to_FILTER_WHERE" in result.applied_transformations
+    assert "CALCULATE_filter_to_FILTER_WHERE" in result.applied_transformations
 
 
 def test_calculate_filter_converts_dax_double_quotes():

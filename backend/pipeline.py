@@ -6,6 +6,7 @@ YAML generation, evaluation reporting, and deployment.
 """
 
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -194,6 +195,22 @@ class MigrationPipeline:
         step = self._start_step("translate")
         result.steps.append(step)
         all_translations = {}
+        # Row-level-security / measure-security tables: those named in RLS role
+        # permissions, plus tables whose name signals security (e.g. "Measure
+        # Security", "User Security"). Measures whose home table is one of these
+        # are permission-check measures used to gate other measures in-DAX.
+        security_tables = {
+            tname for role in model.get("roles", [])
+            for tname in (role.get("tablePermissions", {}) or {})
+        }
+        security_tables |= {
+            t.get("name", "") for t in model.get("tables", [])
+            if re.search(r'security|permission', t.get("name", ""), re.IGNORECASE)
+        }
+        security_measures = {
+            m["name"] for t in model.get("tables", []) if t.get("name", "") in security_tables
+            for m in t.get("measures", [])
+        }
         try:
             fact_tables = [t for t in filtered_tables if t.get("measures")]
             for fact in fact_tables:
@@ -201,6 +218,8 @@ class MigrationPipeline:
                 translator = DAXTranslator(
                     relationships=relationships,
                     known_measures={},
+                    security_tables=security_tables,
+                    security_measures=security_measures,
                 )
                 translations = translator.translate_batch(measures, fact.get("name", ""))
                 for m, tr in zip(measures, translations):
@@ -209,6 +228,7 @@ class MigrationPipeline:
                     m["translation_status"] = tr.status
                     m["confidence"] = tr.confidence
                     m["window"] = tr.window_spec
+                    m["rls_applied"] = tr.rls_applied
 
             converted = sum(1 for t in all_translations.values() if t.status == "converted")
             self._notify("translate", 50, f"Translated {converted}/{len(all_translations)} measures")

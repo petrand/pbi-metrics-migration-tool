@@ -102,10 +102,16 @@ def _escape_yaml_string(s: str) -> str:
 
 
 _RESIDUAL_DAX_FUNCS = re.compile(
-    r'\b(CALCULATE|CALCULATETABLE|FILTER|ALL|ALLEXCEPT|VALUES|ADDCOLUMNS|'
+    r'\b(CALCULATE|CALCULATETABLE|ALL|ALLEXCEPT|VALUES|ADDCOLUMNS|'
     r'SELECTCOLUMNS|EARLIER|RELATEDTABLE|USERELATIONSHIP|DATESINPERIOD)\s*\(',
     re.IGNORECASE,
 )
+
+# A DAX ``FILTER(...)`` call is residual, but SQL ``agg FILTER (WHERE ...)`` is a
+# valid Databricks aggregate filter — not residual DAX. Only flag ``FILTER(``
+# that is NOT immediately followed by ``WHERE`` (mirrors the validator's
+# detect_residual_dax so the exclusion gate and validator agree).
+_DAX_FILTER_CALL = re.compile(r'\bFILTER\s*\(\s*(?!WHERE\b)', re.IGNORECASE)
 
 
 def _quote_ident(seg: str) -> str:
@@ -126,6 +132,8 @@ def _has_residual_dax(expr: str) -> bool:
     if not expr:
         return True
     if '```' in expr or '[' in expr:
+        return True
+    if _DAX_FILTER_CALL.search(expr):
         return True
     return bool(_RESIDUAL_DAX_FUNCS.search(expr))
 
@@ -216,6 +224,8 @@ class MetricViewYAMLGenerator:
         translated_measures: list,
         overrides=None,
         convert_nested_windows: bool = True,
+        known_columns: dict = None,
+        source_schema: str = None,
     ) -> MetricViewSpec:
         """Build a MetricViewSpec from semantic model components.
 
@@ -233,8 +243,11 @@ class MetricViewYAMLGenerator:
         Returns:
             MetricViewSpec ready for YAML rendering.
         """
+        # Source tables may live in a different schema than the views (a raw vs
+        # semantic split). `source_schema` defaults to `schema` (co-located).
+        src_schema = source_schema or schema
         fact_table_lower = _sanitize_name(fact_table)
-        source_fqn = f"{catalog}.{schema}.{fact_table_lower}"
+        source_fqn = f"{catalog}.{src_schema}.{fact_table_lower}"
         view_name = f"{catalog}.{schema}.{fact_table_lower}_metric_view"
 
         spec = MetricViewSpec(
@@ -245,7 +258,7 @@ class MetricViewYAMLGenerator:
 
         # ── Build joins (with cardinality/rely + snowflake nesting) ──
         join_nodes, alias_path = self._build_joins(
-            fact_table_lower, relationships, catalog, schema, overrides
+            fact_table_lower, relationships, catalog, src_schema, overrides
         )
         # Attach nested joins to their parents (snowflake schemas).
         for node in join_nodes.values():
@@ -346,6 +359,48 @@ class MetricViewYAMLGenerator:
             self._apply_measure_override(m, tm["name"], overrides)
             spec.measures.append(m)
 
+        # ── Schema-aware pruning ──
+        # When the caller supplies the target tables' real columns, exclude any
+        # measure/dimension referencing a column that doesn't exist there (the
+        # TMDL model can drift from the physically-loaded tables). Done before
+        # window/pushdown/ref-resolution so dependents cascade-exclude cleanly,
+        # and recorded like any other exclusion so the drop is never silent.
+        if known_columns:
+            # 1. Drop joins whose ON clause references a missing key column (a FK
+            # absent from the physically-loaded table) — and their whole subtree.
+            spec.joins, dropped_aliases = self._prune_joins(
+                spec.joins, fact_table_lower, known_columns)
+            # 2. Drop dimensions that reference a removed join alias, then any
+            # remaining dimension referencing a missing column.
+            if dropped_aliases:
+                spec.dimensions = [
+                    d for d in spec.dimensions
+                    if not self._expr_uses_alias(d.expr, dropped_aliases)
+                ]
+            spec.dimensions = [
+                d for d in spec.dimensions
+                if not self._refs_missing_columns(d.expr, fact_table_lower, known_columns)
+            ]
+            # 3. Exclude measures referencing a removed join alias or a missing
+            # column — recorded so the drop is never silent.
+            kept = []
+            for m in spec.measures:
+                if dropped_aliases and self._expr_uses_alias(m.expr, dropped_aliases):
+                    excluded[m.name] = (
+                        "references a join removed because its key column is not "
+                        "present in the target table"
+                    )
+                    continue
+                miss = self._refs_missing_columns(m.expr, fact_table_lower, known_columns)
+                if miss:
+                    excluded[m.name] = (
+                        "references column(s) not present in the target table: "
+                        + ", ".join(sorted(set(miss)))
+                    )
+                    continue
+                kept.append(m)
+            spec.measures = kept
+
         # A window measure's `order` must reference a declared dimension. Time
         # -intelligence measures order by a fact-table date column, which is not
         # otherwise exposed as a dimension, so add one where it is missing.
@@ -409,6 +464,64 @@ class MetricViewYAMLGenerator:
         spec.excluded_measures = excluded
 
         return spec
+
+    def _prune_joins(self, joins: list, fact_lower: str, known_columns: dict):
+        """Drop joins whose ON clause references a column absent from the target
+        tables (a missing FK), along with their nested subtree. Returns
+        (kept_joins, dropped_alias_set)."""
+        dropped: set = set()
+
+        def _collect(js):
+            for j in js:
+                dropped.add(j.name)
+                _collect(j.joins)
+
+        def _keep(js):
+            out = []
+            for j in js:
+                if self._refs_missing_columns(j.on, fact_lower, known_columns):
+                    dropped.add(j.name)
+                    _collect(j.joins)
+                    continue
+                j.joins = _keep(j.joins)
+                out.append(j)
+            return out
+
+        return _keep(joins), dropped
+
+    @staticmethod
+    def _expr_uses_alias(expr: str, aliases: set) -> bool:
+        """True if *expr* references any of *aliases* as a table qualifier
+        (``alias.`` — including as a segment of a snowflake dotted path)."""
+        if not expr or not aliases:
+            return False
+        return any(re.search(rf'\b{re.escape(a)}\.', expr) for a in aliases)
+
+    @staticmethod
+    def _refs_missing_columns(expr: str, fact_lower: str, known_columns: dict) -> list:
+        """Return ``alias.col`` references in *expr* whose column is absent from
+        the target tables in *known_columns* (``{table: {col, ...}}``).
+
+        ``source`` resolves to *fact_lower*. A reference whose alias is unknown
+        (no column list) is skipped — we can only validate tables we were told
+        about. A ``a.b`` pair where ``b`` is itself a known table alias is a
+        snowflake chain link, not a column, so it is ignored.
+        """
+        if not expr or not known_columns:
+            return []
+        known_aliases = set(known_columns)
+        missing = []
+        for alias, col in re.findall(r'([A-Za-z_]\w*)\.(`[^`]+`|[A-Za-z_]\w*)', expr):
+            col_clean = col.strip('`').lower()
+            if col_clean in known_aliases:
+                continue  # chain link (alias.<nested-table>), not a column
+            table = fact_lower if alias == "source" else alias
+            cols = known_columns.get(table)
+            if cols is None:
+                continue  # unknown alias — can't validate
+            if col_clean not in cols:
+                missing.append(f"{alias}.{col_clean}")
+        return missing
 
     @staticmethod
     def _topo_order_measures(measures: list) -> list:
@@ -651,8 +764,21 @@ class MetricViewYAMLGenerator:
 
             from_table_lower = _sanitize_name(from_parts[0])
             to_table_lower = _sanitize_name(to_parts[0])
-            if to_table_lower == fact_lower or to_table_lower in nodes:
+            if to_table_lower == fact_lower:
                 continue
+            # A dimension can be related to several facts (e.g. Scorecard Measures
+            # -> Sales Budget / Kepion / Scorecard). Keying nodes by target alone
+            # means the FIRST relationship wins, which may parent the join to a
+            # table not reachable from THIS fact — the join is then dropped and
+            # measures filtering on it are excluded. A direct edge from the
+            # current fact must therefore override a previously-recorded indirect
+            # one so the join roots at this fact.
+            existing = nodes.get(to_table_lower)
+            if existing is not None:
+                is_direct = from_table_lower == fact_lower
+                existing_direct = existing["_parent"] is None
+                if not (is_direct and not existing_direct):
+                    continue
 
             from_col = _sanitize_name(from_parts[1])
             to_col = _sanitize_name(to_parts[1])
@@ -932,6 +1058,8 @@ class MetricViewYAMLGenerator:
         schema: str,
         overrides=None,
         convert_nested_windows: bool = True,
+        known_columns: dict = None,
+        source_schema: str = None,
     ) -> list:
         """Generate metric view specs for all fact groups in a model.
 
@@ -982,6 +1110,8 @@ class MetricViewYAMLGenerator:
                 translated_measures=measures,
                 overrides=overrides,
                 convert_nested_windows=convert_nested_windows,
+                known_columns=known_columns,
+                source_schema=source_schema,
             )
             # A Metric View must define at least one measure or dimension.
             # After excluding residual/window measures a fact group can end up

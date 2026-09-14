@@ -88,6 +88,11 @@ class MeasureEvaluation:
     exclusion_reason: Optional[str] = None
     """If not deployed, why the generator excluded it from the view."""
 
+    rls_applied: bool = False
+    """True when this measure carried in-measure row-level-security (a security
+    gate / security-table filter) that was removed for conversion. Surfaced to
+    the UI as an asterisk; access must be enforced by the view's row filters."""
+
 
 @dataclass
 class FactGroupEvaluation:
@@ -336,6 +341,7 @@ class EvaluationReporter:
             window_spec=_get(r, "window_spec"),
             display_folder=_get(r, "display_folder"),
             format_string=_get(r, "format_string"),
+            rls_applied=bool(_get(r, "rls_applied", False)),
         )
 
         logger.debug(

@@ -579,9 +579,16 @@ function ResultsExplorer({ groups, totals }) {
                           <div onClick={() => setOpenMeasure(mOpen ? null : key)}
                             style={{ padding: '9px 14px 9px 30px', cursor: 'pointer', display: 'grid', gridTemplateColumns: 'minmax(150px,1fr) minmax(180px,1.6fr) minmax(180px,1.6fr) 90px', gap: 12, alignItems: 'start', fontSize: 12, borderBottom: '1px solid rgba(255,255,255,0.04)', borderLeft: `3px solid ${color}`, background: mOpen ? 'rgba(99,102,241,0.06)' : notInView ? 'rgba(148,163,184,0.05)' : 'transparent' }}>
                             <div style={{ minWidth: 0 }}>
-                              <div style={{ fontWeight: 600, opacity: notInView ? 0.75 : 1, wordBreak: 'break-word' }}>{m.name}</div>
+                              <div style={{ fontWeight: 600, opacity: notInView ? 0.75 : 1, wordBreak: 'break-word' }}>
+                                {m.name}
+                                {m.rls_applied && (
+                                  <span title="RLS was previously applied in-measure; the security gate was removed for conversion — enforce access via the view's row filters"
+                                    style={{ color: '#f59e0b', marginLeft: 4, cursor: 'help' }}>*</span>
+                                )}
+                              </div>
                               <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 3, alignItems: 'center' }}>
                                 <span className="tag" style={{ fontSize: 9, background: `${color}22`, color }}>{m.status}</span>
+                                {m.rls_applied && <span className="tag" title="Row-level security was applied in the original measure and removed for conversion; enforce via the view's row filters" style={{ fontSize: 9, background: 'rgba(245,158,11,0.15)', color: '#f59e0b' }}>* RLS removed</span>}
                                 {notInView && <span title={m.exclusion_reason} className="tag" style={{ fontSize: 9, background: 'rgba(148,163,184,0.15)', color: '#cbd5e1' }}>⊘ {classifyExclusion(m)}</span>}
                                 {notInView && excludedDeps(m, g.measures).length > 0 && (
                                   <span title={m.exclusion_reason} style={{ fontSize: 9, color: '#f0abfc' }}>→ {excludedDeps(m, g.measures).join(', ')}</span>

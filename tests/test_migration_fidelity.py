@@ -145,6 +145,212 @@ def test_e5_confidence_reflects_status():
     assert converted.status == "converted"
 
 
+# ── Filter/context DAX recovery (epic wo0) ──────────────────────────────────
+
+def test_gate_keeps_valid_filter_where():
+    """wo0.1: `agg FILTER (WHERE ...)` is valid SQL and must NOT be excluded as
+    residual DAX (only a DAX FILTER( not followed by WHERE is residual)."""
+    from backend.yaml_generator import _has_residual_dax
+    assert not _has_residual_dax("COUNT(DISTINCT source.c) FILTER (WHERE source.x = 0)")
+    assert not _has_residual_dax("MEASURE(`Base`) FILTER (WHERE source.flag = 1)")
+    assert _has_residual_dax("SUM(source.a) FILTER (source.x, source.y)")  # DAX FILTER(
+
+
+def test_gate_keeps_filter_where_measure_in_view():
+    """A measure translating to `... FILTER (WHERE ...)` reaches the view."""
+    spec = _spec_with([
+        {"name": "Active", "translated_sql": "COUNT(DISTINCT source.custkey) FILTER (WHERE source.care = 0)"},
+    ])
+    assert "Active" in [m.name for m in spec.measures]
+    assert "Active" not in spec.excluded_measures
+
+
+def test_calculate_bare_table_filter():
+    """wo0.2: FILTER('<table>', cond) (no ALL) becomes FILTER (WHERE cond)."""
+    t = DAXTranslator()
+    r = t.translate("CALCULATE(SUM(Sales[amt]), FILTER('Sales', Sales[flag] = 1))", "Sales")
+    sql = r.translated_sql
+    assert "FILTER (WHERE" in sql
+    # No leftover nested DAX FILTER( inside the WHERE clause.
+    assert "FILTER (WHERE FILTER" not in sql
+    assert "source.flag = 1" in sql
+
+
+def test_calculate_non_equality_operator():
+    """wo0.3: comparison operators other than `=` are recognised as filters."""
+    t = DAXTranslator()
+    r = t.translate("CALCULATE(SUM(Sales[qty]), Sales[qty] > 0)", "Sales")
+    assert "FILTER (WHERE" in r.translated_sql and "source.qty > 0" in r.translated_sql
+
+
+def test_calculate_blank_comparison_to_null():
+    """wo0.3: `<> blank()` maps to `IS NOT NULL`."""
+    t = DAXTranslator()
+    r = t.translate("CALCULATE(AVERAGE(Sales[e]), FILTER('Sales', Sales[e] <> blank()))", "Sales")
+    assert "IS NOT NULL" in r.translated_sql.upper()
+    assert "BLANK" not in r.translated_sql.upper()
+
+
+def test_calculate_multi_predicate_anded():
+    """wo0.4: every filter predicate is kept and AND-ed — none silently dropped."""
+    t = DAXTranslator()
+    r = t.translate(
+        'CALCULATE(DISTINCTCOUNT(Sales[inv]), Sales[type] = "I", Sales[care] = 0, Sales[ratted] = 0)',
+        "Sales",
+    )
+    sql = r.translated_sql
+    assert "COUNT(DISTINCT source.inv)" in sql
+    for frag in ("source.type = 'I'", "source.care = 0", "source.ratted = 0"):
+        assert frag in sql, f"dropped predicate: {frag}"
+    assert sql.upper().count(" AND ") == 2
+
+
+def test_calculate_userelationship_dropped_with_warning():
+    """wo0.6: USERELATIONSHIP is dropped (with a warning), other predicates kept."""
+    t = DAXTranslator()
+    r = t.translate(
+        "CALCULATE(COUNTROWS('Sales'), Sales[k] <> -1, USERELATIONSHIP(Calendar[ck], Sales[dk]))",
+        "Sales",
+    )
+    sql = r.translated_sql
+    assert "USERELATIONSHIP" not in sql.upper()
+    assert "COUNT(*) FILTER (WHERE" in sql and "source.k <> -1" in sql
+    assert any("USERELATIONSHIP" in w for w in r.warnings)
+
+
+def test_qualified_measure_ref_resolves_to_measure():
+    """wo0.5: 'Table'[Measure] resolves to MEASURE(`...`), not a fact column."""
+    t = DAXTranslator()
+    r = t.translate("CALCULATE('Sales Budget'[Bgt Daily Sales], DATESMTD('Calendar'[Date]))",
+                    "Sales Budget", measures={"Bgt Daily Sales": "SUM(source.x)"})
+    assert "MEASURE(`Bgt Daily Sales`)" in r.translated_sql
+    assert "source.bgt_daily_sales" not in r.translated_sql
+
+
+def test_filter_over_values_not_a_plain_filter():
+    """FILTER(VALUES(...), cond) is an iteration, not a row filter — left for
+    manual review (kept partial), not silently rewritten."""
+    t = DAXTranslator()
+    r = t.translate("CALCULATE(SUM(Sales[amt]), FILTER(VALUES(Sales[x]), Sales[x] > 0))", "Sales")
+    assert r.status != "converted"
+
+
+# ── Schema-aware pruning (wo0.9) + join scoping (wo0.10) ─────────────────────
+
+def test_prune_measure_referencing_missing_column():
+    """With known_columns, a measure referencing a column absent from the target
+    table is excluded (with a reason), not emitted into a view that won't deploy."""
+    gen = MetricViewYAMLGenerator()
+    spec = gen.build_spec(
+        "M", "Sales", "main", "s",
+        tables=[{"name": "Sales", "columns": [], "measures": []}],
+        relationships=[],
+        translated_measures=[
+            {"name": "Good", "translated_sql": "SUM(source.amt)"},
+            {"name": "Bad", "translated_sql": "SUM(source.ghost)"},
+        ],
+        known_columns={"sales": {"amt"}},
+    )
+    names = [m.name for m in spec.measures]
+    assert "Good" in names and "Bad" not in names
+    assert "ghost" in spec.excluded_measures["Bad"]
+
+
+def test_prune_skips_validation_for_unknown_tables():
+    """A ref to a table not in known_columns can't be validated, so it's kept."""
+    gen = MetricViewYAMLGenerator()
+    spec = gen.build_spec(
+        "M", "Sales", "main", "s",
+        tables=[{"name": "Sales", "columns": [], "measures": []}],
+        relationships=[],
+        translated_measures=[
+            {"name": "X", "translated_sql": "SUM(source.amt) FILTER (WHERE dim.flag = 1)"},
+        ],
+        known_columns={"sales": {"amt"}},  # 'dim' unknown -> not validated
+    )
+    assert "X" in [m.name for m in spec.measures]
+
+
+def test_source_schema_separates_source_from_view():
+    """source_schema routes the source/join FQNs to a different schema than the
+    view itself (raw vs semantic split)."""
+    gen = MetricViewYAMLGenerator()
+    spec = gen.build_spec(
+        "M", "Sales", "cat", "views",
+        tables=[{"name": "Sales", "columns": [], "measures": []}],
+        relationships=[],
+        translated_measures=[{"name": "T", "translated_sql": "SUM(source.amt)"}],
+        source_schema="raw",
+    )
+    assert spec.source == "cat.raw.sales"
+    assert spec.view_name == "cat.views.sales_metric_view"
+
+
+def test_join_direct_fact_edge_wins_over_indirect():
+    """wo0.10: a dimension related to several facts must join rooted at the
+    CURRENT fact (direct edge), not an earlier indirect relationship."""
+    gen = MetricViewYAMLGenerator()
+    rels = [
+        {"from": "OtherFact.dimkey", "to": "Dim.dimkey", "type": "manyToOne"},  # indirect, seen first
+        {"from": "Sales.dimkey", "to": "Dim.dimkey", "type": "manyToOne"},      # direct from current fact
+    ]
+    spec = gen.build_spec(
+        "M", "Sales", "main", "s",
+        tables=[{"name": "Sales", "columns": [], "measures": []},
+                {"name": "Dim", "columns": [{"name": "Label", "dataType": "string"}], "measures": []}],
+        relationships=rels,
+        translated_measures=[{"name": "T", "translated_sql": "SUM(source.amt) FILTER (WHERE dim.label = 'x')"}],
+    )
+    join_names = [j.name for j in spec.joins]
+    assert "dim" in join_names, f"direct fact->dim join missing: {join_names}"
+    dim_join = next(j for j in spec.joins if j.name == "dim")
+    assert dim_join.on == "dim.dimkey = source.dimkey"
+
+
+# ── In-measure RLS handling ──────────────────────────────────────────────────
+
+def test_rls_gate_stripped_and_flagged():
+    """A permission-gate IF over a security measure is reduced to its then-branch
+    and the measure is flagged rls_applied (RLS enforced via row filters instead)."""
+    t = DAXTranslator(security_tables=["Measure Security"],
+                      security_measures=["Count Measures E"])
+    r = t.translate(
+        "IF([Count Measures E] > 0, CALCULATE(SUM([CostE]), 'Measure Security'), BLANK())",
+        "Sales",
+    )
+    assert r.rls_applied is True
+    assert r.translated_sql == "SUM(source.coste)"
+    assert "CALCULATE" not in r.translated_sql.upper()
+    assert any("RLS" in w for w in r.warnings)
+
+
+def test_security_table_filter_arg_dropped_and_flagged():
+    """A bare security-table CALCULATE filter arg is dropped and flags RLS."""
+    t = DAXTranslator(security_tables=["Measure Security"])
+    r = t.translate("CALCULATE(SUM([CostE]), 'Measure Security')", "Sales")
+    assert r.translated_sql == "SUM(source.coste)"
+    assert r.rls_applied is True
+
+
+def test_non_security_table_filter_arg_dropped_silently():
+    """A bare NON-security table filter arg (context transition) is dropped but
+    NOT flagged as RLS."""
+    t = DAXTranslator()
+    r = t.translate("CALCULATE(DISTINCTCOUNT(Customer[Customer Name]), Sales)", "Sales")
+    assert "COUNT(DISTINCT" in r.translated_sql.upper()
+    assert "CALCULATE" not in r.translated_sql.upper()
+    assert r.rls_applied is False
+
+
+def test_non_rls_if_untouched():
+    """A plain IF (not gating on a security measure) is left for the normal
+    conditional pass — it still becomes a CASE and is not flagged rls_applied."""
+    t = DAXTranslator(security_measures=["Count Measures E"])
+    r = t.translate("IF([Requested] = 0, BLANK(), SUM(Sales[difot]))", "Sales")
+    assert "CASE WHEN" in r.translated_sql.upper()
+    assert r.rls_applied is False
+
+
 # ── Deploy-hardening fixes (found deploying to a live workspace) ─────────────
 
 def test_offset_window_has_semiadditive():
