@@ -19,6 +19,7 @@ from backend.validator import MetricViewValidator
 from backend.yaml_generator import MetricViewYAMLGenerator
 from backend.dashboard_generator import DashboardGenerator
 from backend.lakeview_client import LakeviewClient
+from backend import rls_generator
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,8 @@ class MigrationResult:
     dashboard_id: str = ""
     dashboard_url: str = ""
     dashboard_spec: Optional[dict] = None
+    rls_notes: List[str] = field(default_factory=list)
+    rls_scaffolding: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -90,6 +93,8 @@ class MigrationResult:
             "errors": self.errors,
             "dashboard_id": self.dashboard_id,
             "dashboard_url": self.dashboard_url,
+            "rls_notes": self.rls_notes,
+            "rls_scaffolding": self.rls_scaffolding,
         }
 
 
@@ -220,10 +225,21 @@ class MigrationPipeline:
                 catalog=config.catalog,
                 schema=config.schema,
             )
+            # Keyed by sanitized source table so the evaluate step can attach
+            # per-view info: excluded measures + converted dimension columns.
+            excluded_by_source = {}
+            dims_by_source = {}
             for spec, yaml_str, ddl_str in gen_results:
                 group_name = spec.view_name.split(".")[-1] if spec.view_name else "default"
                 result.generated_yaml[group_name] = yaml_str
                 result.generated_sql[group_name] = ddl_str
+                src_key = spec.source.split(".")[-1] if spec.source else group_name
+                excluded_by_source[src_key] = dict(getattr(spec, "excluded_measures", {}) or {})
+                dims_by_source[src_key] = [
+                    {"name": d.name, "expr": d.expr} for d in getattr(spec, "dimensions", [])
+                ]
+            self._excluded_by_source = excluded_by_source
+            self._dims_by_source = dims_by_source
 
             self._notify("generate", 65, f"Generated {len(gen_results)} metric view(s)")
             self._complete_step(step, f"Generated {len(gen_results)} metric view DDL(s)")
@@ -266,21 +282,30 @@ class MigrationPipeline:
         result.steps.append(step)
         try:
             fact_group_evals = []
+            excluded_by_source = getattr(self, "_excluded_by_source", {})
             for fact in [t for t in filtered_tables if t.get("measures")]:
+                src_key = fact.get("name", "").lower().replace(" ", "_")
+                excluded = excluded_by_source.get(src_key, {})
                 measure_evals = []
                 for m in fact.get("measures", []):
                     tr = all_translations.get(m["name"])
                     if tr:
                         me = self.evaluator.evaluate_measure(m["name"], m.get("expression", ""), tr)
+                        # Flag measures the generator dropped from the deployable view.
+                        if m["name"] in excluded:
+                            me.deployed = False
+                            me.exclusion_reason = excluded[m["name"]]
                         measure_evals.append(me)
 
+                dims = getattr(self, "_dims_by_source", {}).get(src_key, [])
                 fg = self.evaluator.evaluate_fact_group(
                     group_name=fact.get("name", ""),
                     source_table=f"{config.catalog}.{config.schema}.{fact.get('name', '').lower().replace(' ', '_')}",
                     measures=measure_evals,
-                    dims_count=0,
+                    dims_count=len(dims),
                     joins_count=len(relationships),
                 )
+                fg.dimensions = dims
                 fact_group_evals.append(fg)
 
             summary = self.evaluator.generate_pipeline_summary(
@@ -290,6 +315,7 @@ class MigrationPipeline:
                 schema=config.schema,
                 duration=time.monotonic() - pipeline_start,
                 started_at=result.started_at,
+                total_relationships=len(relationships),
             )
             result.pipeline_summary = self.evaluator.to_dict(summary)
             text_summary = self.evaluator.to_text_summary(summary)
@@ -298,6 +324,25 @@ class MigrationPipeline:
             self._complete_step(step, "Report generated")
         except Exception as e:
             self._fail_step(step, str(e))
+
+        # ── Step 6a: Row-Level Security (report + scaffolding) ──
+        roles = model.get("roles", [])
+        if rls_generator.roles_with_rls(roles):
+            step = self._start_step("rls")
+            result.steps.append(step)
+            try:
+                result.rls_notes = rls_generator.rls_notes(roles)
+                result.rls_scaffolding = rls_generator.generate_rls_scaffolding(
+                    roles, config.catalog, config.schema
+                )
+                for note in result.rls_notes:
+                    logger.warning("RLS: %s", note)
+                self._complete_step(
+                    step,
+                    f"{len(result.rls_notes)} role(s) with RLS need manual UC row filters",
+                )
+            except Exception as e:
+                self._fail_step(step, str(e))
 
         # ── Step 7: Deploy (optional) ──
         if config.deploy and dbx_client and config.warehouse_id:

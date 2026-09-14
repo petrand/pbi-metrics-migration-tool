@@ -103,9 +103,10 @@ def test_isblank_translates_to_is_null():
     assert "IS NULL" in result.translated_sql
 
 
-def test_iferror_translates_to_try_coalesce():
+def test_iferror_translates_to_coalesce():
+    # Databricks SQL has no bare TRY() scalar; IFERROR maps to COALESCE.
     result = translator().translate("IFERROR(1/0, 0)")
-    assert "TRY(" in result.translated_sql
+    assert "TRY(" not in result.translated_sql
     assert "COALESCE" in result.translated_sql
 
 
@@ -237,22 +238,36 @@ def test_averagex_translates_to_avg():
 
 # ── CALCULATE ─────────────────────────────────────────────────────────────────
 
-def test_calculate_simple_filter_produces_case_when():
+def test_calculate_simple_filter_produces_filter_where():
+    """CALCULATE with a simple filter maps to a metric-view FILTER (WHERE ...)."""
     result = translator().translate(
         "CALCULATE(SUM(FactSales[SalesAmount]), FactSales[Region] = 'West')",
         "FactSales",
     )
-    assert "CASE WHEN" in result.translated_sql
+    assert "FILTER (WHERE" in result.translated_sql
+    assert "SUM(source.salesamount)" in result.translated_sql
+    assert "source.region = 'West'" in result.translated_sql
+    assert "CALCULATE_simple_filter_to_FILTER_WHERE" in result.applied_transformations
 
 
-def test_calculate_filter_all_produces_case_when():
-    """CALCULATE with FILTER(ALL(...)) should produce CASE WHEN conditional."""
+def test_calculate_filter_all_produces_filter_where():
+    """CALCULATE with FILTER(ALL(...)) maps to a metric-view FILTER (WHERE ...)."""
     result = translator().translate(
         "CALCULATE(SUM(FactSales[SalesAmount]), FILTER(ALL(FactSales), FactSales[Region] = 'West'))",
         "FactSales",
     )
-    assert "CASE WHEN" in result.translated_sql
-    assert "CALCULATE_FILTER_ALL_to_CASE_WHEN" in result.applied_transformations
+    assert "FILTER (WHERE" in result.translated_sql
+    assert "CALCULATE_FILTER_ALL_to_FILTER_WHERE" in result.applied_transformations
+
+
+def test_calculate_filter_converts_dax_double_quotes():
+    """DAX double-quoted string literals become SQL single-quoted literals."""
+    result = translator().translate(
+        'CALCULATE(SUM(FactSales[SalesAmount]), FactSales[Region] = "West")',
+        "FactSales",
+    )
+    assert "'West'" in result.translated_sql
+    assert '"West"' not in result.translated_sql
 
 
 # ── Time Intelligence ─────────────────────────────────────────────────────────
@@ -264,7 +279,9 @@ def test_totalytd_produces_window_spec():
     )
     assert result.window_spec is not None
     assert result.window_spec.get("range") == "cumulative"
-    assert result.window_spec.get("group_by") == "year"
+    # Spec-compliant window keys: `order` (the date column), not `group_by`.
+    assert result.window_spec.get("order") == "orderdate"
+    assert "group_by" not in result.window_spec
 
 
 def test_totalytd_inner_expression_preserved():

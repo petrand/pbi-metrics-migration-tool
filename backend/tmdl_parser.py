@@ -142,12 +142,36 @@ class TMDLRelationship:
 
 
 @dataclass
+class TMDLRole:
+    """A security role with its model permission and row-level filters.
+
+    ``table_permissions`` maps a table name to its DAX row-filter predicate;
+    these encode row-level security (RLS) that Metric Views cannot express and
+    must be reproduced as Unity Catalog row filters.
+    """
+
+    name: str
+    model_permission: Optional[str] = None
+    table_permissions: Dict[str, str] = field(default_factory=dict)
+    members: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "modelPermission": self.model_permission,
+            "tablePermissions": dict(self.table_permissions),
+            "members": list(self.members),
+        }
+
+
+@dataclass
 class SemanticModel:
     """Top-level container for a parsed TMDL semantic model."""
 
     name: str
     tables: List[TMDLTable] = field(default_factory=list)
     relationships: List[TMDLRelationship] = field(default_factory=list)
+    roles: List[TMDLRole] = field(default_factory=list)
     culture: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -157,6 +181,7 @@ class SemanticModel:
             "culture": self.culture,
             "tables": [t.to_dict() for t in self.tables],
             "relationships": [r.to_dict() for r in self.relationships],
+            "roles": [r.to_dict() for r in self.roles],
         }
 
     def to_json(self, **kwargs) -> str:
@@ -752,7 +777,50 @@ class TMDLParser:
             except Exception:
                 logger.exception("Error parsing relationships.tmdl -- skipping.")
 
+        # Roles / row-level security (roles/ subdirectory or roles.tmdl)
+        role_files: List[Path] = []
+        roles_dir = root / "roles"
+        if roles_dir.is_dir():
+            role_files = sorted(roles_dir.glob("*.tmdl"))
+        elif (root / "roles.tmdl").exists():
+            role_files = [root / "roles.tmdl"]
+        for rf in role_files:
+            try:
+                raw = rf.read_text(encoding="utf-8", errors="replace")
+                model.roles.extend(self._parse_roles(raw))
+            except Exception:
+                logger.exception("Error parsing role file %s -- skipping.", rf)
+
         return model
+
+    def _parse_roles(self, content: str) -> List[TMDLRole]:
+        """Parse one or more ``role`` blocks from TMDL content.
+
+        Recognises ``modelPermission``, ``tablePermission <Table> = <DAX>`` (the
+        row-level-security predicate), and ``member <principal> = ...`` lines.
+        """
+        roles: List[TMDLRole] = []
+        current: Optional[TMDLRole] = None
+        for line in _tokenise(content):
+            text = line.text
+            if text.startswith("role "):
+                current = TMDLRole(name=_strip_quotes(text[len("role "):].strip()))
+                roles.append(current)
+                continue
+            if current is None:
+                continue
+            if text.startswith("modelPermission:"):
+                current.model_permission = text.split(":", 1)[1].strip()
+            elif text.startswith("tablePermission "):
+                body = text[len("tablePermission "):]
+                if "=" in body:
+                    tbl, expr = body.split("=", 1)
+                    current.table_permissions[_strip_quotes(tbl.strip())] = expr.strip()
+            elif text.startswith("member "):
+                body = text[len("member "):]
+                principal = body.split("=", 1)[0].strip()
+                current.members.append(principal)
+        return roles
 
     # ------------------------------------------------------------------
     # Model-level metadata

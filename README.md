@@ -57,7 +57,12 @@ Power BI models encode a large amount of business logic in DAX measures and tabu
 - **3 built-in sample models** — Sales Analytics, Healthcare KPIs, Financial Reporting for demo/testing
 - **30+ DAX functions translated** — SUM, CALCULATE, FILTER/ALL, DIVIDE, IF, RELATED, VAR/RETURN, time-intelligence, iterators, and more
 - **14-pass translation pipeline** — normalize, VAR/RETURN, time intelligence, CALCULATE (balanced-paren), aggregations, conditionals, logical, dates, text, lookups, iterators, table refs, measure refs, cleanup
-- **Override system** — table/column mappings, extra joins, exclusions, hand-written SQL via `overrides.yaml`
+- **Filtered measures** — `CALCULATE(m, filter)` translates to `m FILTER (WHERE …)` (Metric View filtered measures, GA DBR 18.0) rather than inline `CASE WHEN`
+- **Join cardinality / rely** — many-to-one Power BI relationships emit `rely: {at_most_one_match: true}` for the query speedup (GA DBR 18.1)
+- **Snowflake schemas** — dimension→dimension relationships emit recursive nested `joins:` with dotted-path references (GA DBR 17.1)
+- **Agent metadata** — measure `format` derived from Power BI format strings (currency/percentage/number); `display_name` and `synonyms` supplied via overrides (GA DBR 17.2)
+- **Window measures** — spec-compliant list form with `order` / `range` / `semiadditive` / `offset` / `inclusive` (GA DBR 18.1)
+- **Override system** — table/column mappings, extra joins, exclusions, hand-written SQL, plus `display_name`/`synonyms`/`format` metadata via `overrides.yaml`
 - **Evaluation & audit reports** — per-measure confidence scores, fact-group conversion rates, pipeline summary
 - **YAML v1.1 validation** — structure, SQL expression, circular reference detection, residual DAX detection
 - **Databricks deployment** — pushes metric view DDL via Statement Execution API with rollback support
@@ -227,7 +232,7 @@ curl -X POST http://localhost:8000/api/migrate \
 | Aggregations | SUM, AVERAGE, MIN, MAX, COUNT, DISTINCTCOUNT, COUNTROWS, COUNTBLANK | Supported |
 | Logical | IF, AND, OR, NOT, SWITCH, IFERROR, ISBLANK | Supported |
 | Math | DIVIDE (2- and 3-arg) | Supported |
-| Filter | CALCULATE, FILTER(ALL(...)), simple column filters | Supported |
+| Filter | CALCULATE, FILTER(ALL(...)), simple column filters → `FILTER (WHERE …)` | Supported |
 | Relationship | RELATED, SELECTEDVALUE | Supported |
 | Text | CONCATENATE, CONTAINSSTRING | Supported |
 | Date | TODAY, EOMONTH, EDATE, DATEDIFF, DATEADD | Supported |
@@ -323,6 +328,12 @@ An `app.yaml` is included (uvicorn on port 8000). Set environment variables in t
 | `PBI_TENANT_ID` | Azure tenant ID |
 
 ---
+
+## Known Limitations
+
+- **Power BI cannot query the migrated Metric Views (yet).** Databricks *BI Compatibility mode* — the feature that lets third-party BI tools without native Metric View support query metric views — is currently **disabled by Microsoft in Power BI** (see the [BI + Metric View docs](https://docs.databricks.com/aws/en/partners/bi/bi-metric-view)). This tool performs a one-way Power BI → Databricks migration and is unaffected, but keeping Power BI connected *to* the migrated Metric Views is not currently possible on Microsoft's side.
+- **Semi-additive DAX** (`FIRSTNONBLANK`, `LASTNONBLANK`, `OPENINGBALANCE`) and **path hierarchy** functions (`PATH`, `PATHITEM`) are not auto-translated. Semi-additive behavior can be expressed manually via a window `semiadditive: first|last` in an override.
+- **Time-intelligence period comparisons** (`SAMEPERIODLASTYEAR`, `DATESINPERIOD`) are flagged for manual review; use a window `offset` (e.g. `offset: -12 months`) via a measure override.
 
 ## Contributing
 

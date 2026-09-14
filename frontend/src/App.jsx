@@ -49,6 +49,173 @@ async function apiFetch(path, opts = {}) {
   return res.json();
 }
 
+// ── Results drill-down: per fact table/view, click to expand measures; ──
+//    click a measure to see its full DAX → SQL conversion detail.
+const STATUS_COLOR = {
+  converted: '#4ade80', manual_override: '#4ade80',
+  partial: '#fbbf24', unsupported: '#f87171', excluded: '#94a3b8',
+};
+
+function ConfidenceBar({ value }) {
+  const v = Math.max(0, Math.min(100, value ?? 0));
+  const c = v >= 70 ? '#4ade80' : v >= 40 ? '#fbbf24' : '#f87171';
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+      <div style={{ flex: 1, height: 5, background: 'rgba(255,255,255,0.08)', borderRadius: 3, overflow: 'hidden' }}>
+        <div style={{ width: `${v}%`, height: '100%', background: c }} />
+      </div>
+      <span style={{ fontSize: 11, color: '#94a3b8', width: 32, textAlign: 'right' }}>{value != null ? `${v}%` : '—'}</span>
+    </div>
+  );
+}
+
+function MeasureDetail({ m }) {
+  const rows = [
+    ['Original DAX', m.original_dax, '#fbbf24'],
+    ['Translated SQL', m.translated_sql, '#4ade80'],
+  ];
+  const hasWindow = m.window_spec && (Array.isArray(m.window_spec) ? m.window_spec.length > 0 : Object.keys(m.window_spec).length > 0);
+  return (
+    <div style={{ padding: '10px 14px 14px 34px', background: 'rgba(0,0,0,0.18)', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+      {m.deployed === false && (
+        <div style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 6, background: 'rgba(148,163,184,0.12)', borderLeft: '3px solid #94a3b8' }}>
+          <span style={{ fontSize: 11, fontWeight: 700, color: '#cbd5e1' }}>⊘ Excluded from the deployed view</span>
+          <div style={{ fontSize: 11.5, color: '#94a3b8', marginTop: 2 }}>{m.exclusion_reason || 'not deployable'} — candidate for a manual measure_override.</div>
+        </div>
+      )}
+      {rows.map(([label, val, color]) => (
+        <div key={label} style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 10, textTransform: 'uppercase', color: '#64748b', marginBottom: 3 }}>{label}</div>
+          <code style={{ display: 'block', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color, fontSize: 11.5, lineHeight: 1.5 }}>{val || '—'}</code>
+        </div>
+      ))}
+      {hasWindow && (
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 10, textTransform: 'uppercase', color: '#64748b', marginBottom: 3 }}>Window (applied on top of the SQL)</div>
+          <code style={{ color: '#a5b4fc', fontSize: 11.5 }}>{JSON.stringify(m.window_spec)}</code>
+        </div>
+      )}
+      {(m.applied_transformations || []).length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 6 }}>
+          {m.applied_transformations.map((t, i) => (
+            <span key={i} className="tag tag-info" style={{ fontSize: 9 }}>{t}</span>
+          ))}
+        </div>
+      )}
+      {(m.issues || []).map((x, i) => (
+        <div key={`i${i}`} style={{ fontSize: 11, color: '#f87171', marginTop: 2 }}>⚠ {x}</div>
+      ))}
+      {(m.warnings || []).map((x, i) => (
+        <div key={`w${i}`} style={{ fontSize: 11, color: '#fbbf24', marginTop: 2 }}>• {x}</div>
+      ))}
+    </div>
+  );
+}
+
+function ResultsExplorer({ groups, totals }) {
+  const [openGroup, setOpenGroup] = useState(null);
+  const [openMeasure, setOpenMeasure] = useState(null);
+  const sorted = [...(groups || [])].sort((a, b) => (b.total_measures || 0) - (a.total_measures || 0));
+  const totalMeasures = sorted.reduce((s, g) => s + (g.total_measures || 0), 0);
+
+  if (sorted.length === 0) {
+    return <div className="glass" style={{ padding: 16, color: '#64748b', fontSize: 13 }}>No results yet — run a migration first.</div>;
+  }
+
+  const chip = (label, value, color) => (
+    <div className="glass" style={{ padding: '10px 14px', flex: 1 }}>
+      <div style={{ fontSize: 10, color: '#94a3b8', textTransform: 'uppercase' }}>{label}</div>
+      <div style={{ fontSize: 22, fontWeight: 700, color, marginTop: 2 }}>{value}</div>
+    </div>
+  );
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ display: 'flex', gap: 10 }}>
+        {chip('Fact tables / views', sorted.length, '#a5b4fc')}
+        {chip('Measures', totalMeasures, '#6366f1')}
+        {chip('Converted', totals?.converted ?? '—', '#4ade80')}
+        {chip('Partial', totals?.partial ?? '—', '#fbbf24')}
+        {chip('Conversion', totals?.overall_conversion_rate != null ? `${totals.overall_conversion_rate}%` : '—', '#a78bfa')}
+      </div>
+
+      <div style={{ fontSize: 11, color: '#64748b' }}>Click a fact table to see its measures; click a measure for the DAX → SQL detail.</div>
+
+      {sorted.map(g => {
+        const isOpen = openGroup === g.name;
+        const rate = g.conversion_rate ?? 0;
+        const vClass = g.validation_status === 'OK' ? 'tag-success' : g.validation_status === 'WARNINGS' ? 'tag-warning' : 'tag-error';
+        const notInView = (g.measures || []).filter(x => x.deployed === false).length;
+        const inView = (g.total_measures || 0) - notInView;
+        return (
+          <div key={g.name} className="glass" style={{ overflow: 'hidden' }}>
+            <div onClick={() => { setOpenGroup(isOpen ? null : g.name); setOpenMeasure(null); }}
+              style={{ padding: '12px 16px', cursor: 'pointer', display: 'grid', gridTemplateColumns: '18px minmax(160px,1.4fr) 1fr 120px 90px', gap: 12, alignItems: 'center' }}>
+              <span style={{ color: '#6366f1', transition: 'transform .15s', transform: isOpen ? 'rotate(90deg)' : 'none' }}>▶</span>
+              <div>
+                <div style={{ fontWeight: 600, fontSize: 14 }}>{g.name}</div>
+                <div style={{ fontSize: 10, color: '#64748b' }}>{g.source_table}</div>
+              </div>
+              <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                <span className="tag tag-success" style={{ fontSize: 10 }}>{inView} in view</span>
+                {notInView > 0 && <span className="tag" style={{ fontSize: 10, background: 'rgba(148,163,184,0.15)', color: '#94a3b8' }}>⊘ {notInView} not in view</span>}
+                {(g.dimensions || []).length > 0 && <span className="tag tag-info" style={{ fontSize: 10 }}>{g.dimensions.length} dims</span>}
+                {g.partial > 0 && <span className="tag tag-warning" style={{ fontSize: 10 }}>{g.partial} partial</span>}
+                {g.unsupported > 0 && <span className="tag tag-error" style={{ fontSize: 10 }}>{g.unsupported} unsupported</span>}
+              </div>
+              <div style={{ minWidth: 100 }}><ConfidenceBar value={rate} /></div>
+              <span className={`tag ${vClass}`} style={{ fontSize: 10, justifySelf: 'end' }}>{g.validation_status}</span>
+            </div>
+
+            {isOpen && (
+              <div style={{ borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+                {(g.dimensions || []).length > 0 && (
+                  <div style={{ padding: '10px 14px 12px 34px', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+                    <div style={{ fontSize: 10, textTransform: 'uppercase', color: '#64748b', marginBottom: 6 }}>Converted dimension columns ({g.dimensions.length})</div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(240px,1fr))', gap: '3px 16px' }}>
+                      {g.dimensions.map((d, di) => (
+                        <div key={di} style={{ fontSize: 11.5, display: 'flex', gap: 6, alignItems: 'baseline' }} title={`${d.name} = ${d.expr}`}>
+                          <span style={{ color: '#e2e8f0', fontWeight: 600 }}>{d.name}</span>
+                          <code style={{ color: '#7dd3fc', fontSize: 10.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>← {d.expr}</code>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                <div style={{ padding: '6px 14px 6px 34px', display: 'grid', gridTemplateColumns: 'minmax(160px,1.6fr) minmax(200px,2fr) 120px 100px', gap: 12, fontSize: 10, textTransform: 'uppercase', color: '#64748b', position: 'sticky', top: 0, background: '#202039' }}>
+                  <span>Measure</span><span>Translated SQL</span><span>Confidence</span><span>Status</span>
+                </div>
+                <div style={{ maxHeight: 420, overflowY: 'auto' }}>
+                  {(g.measures || []).map((m, i) => {
+                    const key = `${g.name}::${m.name}::${i}`;
+                    const mOpen = openMeasure === key;
+                    const color = STATUS_COLOR[m.status] || '#94a3b8';
+                    return (
+                      <div key={key}>
+                        <div onClick={() => setOpenMeasure(mOpen ? null : key)}
+                          style={{ padding: '9px 14px 9px 34px', cursor: 'pointer', display: 'grid', gridTemplateColumns: 'minmax(160px,1.6fr) minmax(200px,2fr) 120px 100px', gap: 12, alignItems: 'center', fontSize: 12, borderBottom: '1px solid rgba(255,255,255,0.04)', background: mOpen ? 'rgba(99,102,241,0.06)' : 'transparent' }}>
+                          <span style={{ fontWeight: 600, opacity: m.deployed === false ? 0.6 : 1 }}>
+                            {m.name}
+                            {m.deployed === false && <span title={m.exclusion_reason} style={{ marginLeft: 6, fontSize: 10, color: '#94a3b8' }}>⊘ not in view</span>}
+                          </span>
+                          <code title={m.translated_sql} style={{ color: '#4ade80', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.translated_sql || '—'}</code>
+                          <ConfidenceBar value={m.confidence} />
+                          <span className="tag" style={{ fontSize: 10, background: `${color}22`, color, justifySelf: 'start' }}>{m.status}</span>
+                        </div>
+                        {mOpen && <MeasureDetail m={m} />}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function App() {
   const [page, setPage] = useState('dashboard');
   const [connectTab, setConnectTab] = useState('pbi');
@@ -107,7 +274,22 @@ export default function App() {
 
   // Load sample models + capabilities on mount
   useEffect(() => {
-    apiFetch('/api/samples').then(data => setSampleModels(data.models || data || [])).catch(() => {});
+    apiFetch('/api/samples')
+      .then(async data => {
+        const summaries = data.models || data || [];
+        const models = await Promise.all(
+          summaries.map(async summary => {
+            try {
+              const detail = await apiFetch(`/api/samples/${summary.id}`);
+              return detail.model || detail;
+            } catch (_) {
+              return summary;
+            }
+          })
+        );
+        setSampleModels(models);
+      })
+      .catch(() => {});
     apiFetch('/api/ready').then(data => setCapabilities(data.capabilities || null)).catch(() => {});
   }, []);
 
@@ -117,18 +299,26 @@ export default function App() {
     const interval = setInterval(async () => {
       try {
         const data = await apiFetch(`/api/migrate/${migrationId}/status`);
+        const status = data.status || data.state;
+        const uiState = status === 'failed' ? 'error'
+          : ['complete', 'validated', 'dry_run'].includes(status) ? 'complete'
+          : status;
         if (data.progress !== undefined) setMigrationProgress(data.progress);
-        if (data.state) setMigrationState(data.state);
+        if (uiState) setMigrationState(uiState);
         if (data.logs?.length) {
           const newLogs = data.logs.slice(migrationLog.length);
           newLogs.forEach(l => addLog(l.message || l.msg, l.level || 'info'));
         }
         if (data.yaml) setGeneratedYAML(data.yaml);
         if (data.sql) setGeneratedSQL(data.sql);
-        if (data.state === 'complete' || data.state === 'error') {
+        if (uiState === 'complete' || uiState === 'error') {
           clearInterval(interval);
-          if (data.state === 'complete') {
-            apiFetch(`/api/migrate/${migrationId}/report`).then(r => setMigrationReport(r)).catch(() => {});
+          if (uiState === 'complete') {
+            apiFetch(`/api/migrate/${migrationId}/report`).then(r => {
+              setGeneratedYAML(Object.values(r.generated_yaml || {}).join('\n\n'));
+              setGeneratedSQL(Object.values(r.generated_sql || {}).join('\n\n'));
+              setMigrationReport(r);
+            }).catch(() => {});
           }
         }
       } catch (_) {}
@@ -187,17 +377,32 @@ export default function App() {
     addLog(`Starting migration: ${model.name}`, 'info');
     try {
       const payload = {
-        model: model.id ? undefined : model,
+        model,
         catalog: dbxConfig.catalog,
         schema: dbxConfig.schema,
         warehouse_id: dbxConfig.warehouse_id,
         deploy: !deployDryRun,
         dry_run: deployDryRun,
       };
-      if (model.id) payload.model_id = model.id;
       const data = await apiFetch('/api/migrate', { method: 'POST', body: JSON.stringify(payload) });
       setMigrationId(data.migration_id || data.id);
-      addLog(`Migration started (ID: ${data.migration_id || data.id})`, 'info');
+      setGeneratedYAML(Object.values(data.generated_yaml || {}).join('\n\n'));
+      setGeneratedSQL(Object.values(data.generated_sql || {}).join('\n\n'));
+      setMigrationReport(data);
+      (data.steps || []).forEach(step => addLog(`${step.name}: ${step.message}`, step.status === 'failed' ? 'error' : 'success'));
+
+      const status = data.status;
+      const uiState = status === 'failed' ? 'error'
+        : ['complete', 'validated', 'dry_run'].includes(status) ? 'complete'
+        : status || 'complete';
+      setMigrationState(uiState);
+      setMigrationProgress(['complete', 'error'].includes(uiState) ? 100 : 50);
+      addLog(
+        uiState === 'error'
+          ? `Migration failed (ID: ${data.migration_id || data.id})`
+          : `Migration complete (ID: ${data.migration_id || data.id})`,
+        uiState === 'error' ? 'error' : 'success'
+      );
     } catch (e) {
       addLog(`Error: ${e.message}`, 'error');
       setMigrationState('error');
@@ -253,8 +458,22 @@ export default function App() {
   ];
 
   // Compute dashboard stats from sampleModels
-  const totalMeasures = sampleModels.reduce((sum, m) => sum + (m.tables || []).reduce((s, t) => s + (t.measures?.length || 0), 0), 0);
-  const totalRelationships = sampleModels.reduce((sum, m) => sum + (m.relationships?.length || 0), 0);
+  const totalMeasures = sampleModels.reduce((sum, m) => {
+    if (typeof m.measures === 'number') return sum + m.measures;
+    if (!Array.isArray(m.tables)) return sum;
+    return sum + m.tables.reduce((tableSum, t) => tableSum + (t.measures?.length || 0), 0);
+  }, 0);
+  const totalRelationships = sampleModels.reduce((sum, m) => {
+    if (typeof m.relationships === 'number') return sum + m.relationships;
+    return sum + (Array.isArray(m.relationships) ? m.relationships.length : 0);
+  }, 0);
+  const pipelineSummary = migrationReport?.pipeline_summary || migrationReport;
+  const factGroups = pipelineSummary?.fact_groups || [];
+  const translationResults = factGroups.flatMap(group =>
+    (group.measures || []).map(measure => ({ ...measure, fact_group: group.name }))
+  );
+  const validationResult = migrationReport?.validation_result || {};
+  const validationIssues = validationResult.issues || [];
 
   return (
     <div style={{ display: 'flex', height: '100vh', fontFamily: '-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif', background: 'linear-gradient(135deg,#0f0f23 0%,#1a1a3e 50%,#0d1117 100%)', color: '#e2e8f0', overflow: 'hidden' }}>
@@ -685,28 +904,18 @@ export default function App() {
                         </motion.div>
                       )}
                       {activeTab === 'results' && migrationReport && (
-                        <motion.div key="results" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="glass" style={{ padding: 16 }}>
-                          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 12 }}>Translation Results</div>
-                          {(migrationReport.measures || []).map((r, i) => (
-                            <motion.div key={i} initial={{ opacity: 0, x: -10 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.04 }}
-                              style={{ padding: '10px 14px', borderBottom: '1px solid rgba(255,255,255,0.05)', display: 'grid', gridTemplateColumns: '160px 1fr 1fr 80px 60px', gap: 10, alignItems: 'center', fontSize: 12 }}>
-                              <span style={{ fontWeight: 600 }}>{r.name}</span>
-                              <code style={{ color: '#fbbf24', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.dax || r.original}</code>
-                              <code style={{ color: '#4ade80', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.sql || r.translated}</code>
-                              <span className={`tag ${r.status === 'success' ? 'tag-success' : r.status === 'warning' ? 'tag-warning' : 'tag-error'}`}>{r.confidence ? `${r.confidence}%` : r.status}</span>
-                              <span className={`tag ${r.status === 'success' ? 'tag-success' : 'tag-warning'}`}>{r.status === 'success' ? '✓' : '⚠'}</span>
-                            </motion.div>
-                          ))}
+                        <motion.div key="results" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                          <ResultsExplorer groups={factGroups} totals={pipelineSummary} />
                         </motion.div>
                       )}
                       {activeTab === 'report' && migrationReport && (
                         <motion.div key="report" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
                           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
                             {[
-                              { label: 'Total Measures', value: migrationReport.total_measures ?? migrationReport.summary?.total ?? '—', color: '#6366f1' },
-                              { label: 'Converted', value: migrationReport.converted ?? migrationReport.summary?.converted ?? '—', color: '#4ade80' },
-                              { label: 'Warnings', value: migrationReport.warnings ?? migrationReport.summary?.warnings ?? '—', color: '#fbbf24' },
-                              { label: 'Conversion Rate', value: migrationReport.conversion_rate ? `${migrationReport.conversion_rate}%` : (migrationReport.summary?.rate ?? '—'), color: '#a78bfa' },
+                              { label: 'Total Measures', value: pipelineSummary?.total_measures ?? '—', color: '#6366f1' },
+                              { label: 'Converted', value: pipelineSummary?.converted ?? '—', color: '#4ade80' },
+                              { label: 'Partial', value: pipelineSummary?.partial ?? '—', color: '#fbbf24' },
+                              { label: 'Conversion Rate', value: pipelineSummary?.overall_conversion_rate != null ? `${pipelineSummary.overall_conversion_rate}%` : '—', color: '#a78bfa' },
                             ].map((c, i) => (
                               <div key={i} className="glass" style={{ padding: 16 }}>
                                 <div style={{ fontSize: 11, color: '#94a3b8' }}>{c.label}</div>
@@ -714,12 +923,34 @@ export default function App() {
                               </div>
                             ))}
                           </div>
-                          {migrationReport.issues?.length > 0 && (
-                            <div className="glass" style={{ padding: 16 }}>
-                              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>Issues</div>
-                              {migrationReport.issues.map((issue, i) => (
-                                <div key={i} style={{ fontSize: 12, padding: '6px 10px', marginBottom: 4, background: 'rgba(251,191,36,0.06)', borderRadius: 6, borderLeft: '3px solid #fbbf24', color: '#fbbf24' }}>{issue.message || issue}</div>
+                          <div className="glass" style={{ padding: 16 }}>
+                            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>Fact Groups</div>
+                            <div style={{ maxHeight: 320, overflowY: 'auto' }}>
+                              {factGroups.map(group => (
+                                <div key={group.name} style={{ display: 'grid', gridTemplateColumns: 'minmax(180px,1fr) repeat(4,90px)', gap: 10, padding: '8px 10px', borderBottom: '1px solid rgba(255,255,255,0.05)', alignItems: 'center', fontSize: 12 }}>
+                                  <span style={{ fontWeight: 600 }}>{group.name}</span>
+                                  <span>{group.total_measures} total</span>
+                                  <span style={{ color: '#4ade80' }}>{group.converted} converted</span>
+                                  <span style={{ color: '#fbbf24' }}>{group.partial} partial</span>
+                                  <span className={`tag ${group.validation_status === 'OK' ? 'tag-success' : group.validation_status === 'WARNINGS' ? 'tag-warning' : 'tag-error'}`}>{group.validation_status}</span>
+                                </div>
                               ))}
+                            </div>
+                          </div>
+                          <div className="glass" style={{ padding: 16, display: 'flex', gap: 12 }}>
+                            <span className={`tag ${(validationResult.errors || 0) > 0 ? 'tag-error' : 'tag-success'}`}>{validationResult.errors || 0} validation errors</span>
+                            <span className={`tag ${(validationResult.warnings || 0) > 0 ? 'tag-warning' : 'tag-success'}`}>{validationResult.warnings || 0} warnings</span>
+                            <span style={{ color: '#64748b', fontSize: 12 }}>{pipelineSummary?.duration_seconds != null ? `${pipelineSummary.duration_seconds}s` : ''}</span>
+                          </div>
+                          {validationIssues.length > 0 && (
+                            <div className="glass" style={{ padding: 16 }}>
+                              <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>Validation Issues ({validationIssues.length})</div>
+                              {validationIssues.slice(0, 50).map((issue, i) => (
+                                <div key={i} style={{ fontSize: 12, padding: '6px 10px', marginBottom: 4, background: issue.severity === 'error' ? 'rgba(248,113,113,0.06)' : 'rgba(251,191,36,0.06)', borderRadius: 6, borderLeft: `3px solid ${issue.severity === 'error' ? '#f87171' : '#fbbf24'}`, color: issue.severity === 'error' ? '#f87171' : '#fbbf24' }}>
+                                  <strong>{issue.severity}</strong> · {issue.category}: {issue.message}
+                                </div>
+                              ))}
+                              {validationIssues.length > 50 && <div style={{ color: '#64748b', fontSize: 11, marginTop: 8 }}>Showing first 50 of {validationIssues.length} issues.</div>}
                             </div>
                           )}
                         </motion.div>

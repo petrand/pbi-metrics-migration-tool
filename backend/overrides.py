@@ -45,6 +45,9 @@ class MeasureOverride:
     expr: str
     comment: str = ""
     window: Optional[dict] = None
+    display_name: str = ""
+    synonyms: List[str] = field(default_factory=list)
+    format: Optional[dict] = None
 
 
 @dataclass
@@ -52,6 +55,7 @@ class DimensionOverride:
     name: str
     display_name: str = ""
     description: str = ""
+    synonyms: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -186,6 +190,9 @@ class OverridesManager:
                     expr=spec.get("expr", ""),
                     comment=spec.get("comment", ""),
                     window=spec.get("window"),
+                    display_name=spec.get("display_name", ""),
+                    synonyms=list(spec.get("synonyms", []) or []),
+                    format=spec.get("format"),
                 )
 
         # Dimension overrides
@@ -195,6 +202,7 @@ class OverridesManager:
                     name=name,
                     display_name=spec.get("display_name", ""),
                     description=spec.get("description", ""),
+                    synonyms=list(spec.get("synonyms", []) or []),
                 )
 
         return o

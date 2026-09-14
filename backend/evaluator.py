@@ -81,6 +81,13 @@ class MeasureEvaluation:
     format_string: Optional[str] = None
     """The Power BI format string for the measure, e.g. ``"$#,##0.00"``."""
 
+    deployed: bool = True
+    """Whether this measure made it into the generated/deployable metric view.
+    ``False`` when the generator had to exclude it (see ``exclusion_reason``)."""
+
+    exclusion_reason: Optional[str] = None
+    """If not deployed, why the generator excluded it from the view."""
+
 
 @dataclass
 class FactGroupEvaluation:
@@ -121,6 +128,10 @@ class FactGroupEvaluation:
 
     dimensions_count: int = 0
     """Number of dimension tables linked to this fact group."""
+
+    dimensions: list = field(default_factory=list)
+    """Converted dimension columns exposed by the view, as
+    ``[{"name": <dimension name>, "expr": <source column ref>}]``."""
 
     joins_count: int = 0
     """Number of join relationships defined for this fact group."""
@@ -412,6 +423,7 @@ class EvaluationReporter:
         schema: str,
         duration: float,
         started_at: str,
+        total_relationships: Optional[int] = None,
     ) -> PipelineSummary:
         """
         Roll up a collection of :class:`FactGroupEvaluation` objects into a
@@ -443,7 +455,15 @@ class EvaluationReporter:
         overrides = sum(g.manual_overrides for g in fact_groups)
         excluded = sum(g.excluded for g in fact_groups)
         total_dims = sum(g.dimensions_count for g in fact_groups)
-        total_joins = sum(g.joins_count for g in fact_groups)
+        # `joins_count` is per-fact-group; summing it counts each shared model
+        # relationship once per fact group (N relationships x M fact groups).
+        # When the caller passes the model's distinct relationship count, report
+        # that instead of the inflated sum.
+        total_joins = (
+            total_relationships
+            if total_relationships is not None
+            else sum(g.joins_count for g in fact_groups)
+        )
 
         deployable = converted + overrides
         effective_total = total - excluded

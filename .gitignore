@@ -75,3 +75,36 @@ $RECYCLE.BIN/
 
 # Project-specific
 overrides.yaml
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
+
+# agents
+.codex/
+.cursor/
+.beads/
+.agents/
+AGENTS.md 
+CLAUDE.md 
+
+#data
+tmdl_code/
+metric_views/
+_*/
+_deploy_results.json
+_deploy.py
+_mv_ddl.sql
+_mv_out.txt
+_PR_BODY.md
+_results_dims.png
+_results_view.png
+_run_ssas_migration.py
+_scratch_deploy.py
+_seed_cols.json
+_seed_data.py
+_seed_sources.py
+.claude/settings.json

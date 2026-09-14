@@ -7,6 +7,7 @@ Catches structural, syntactic, and semantic errors before deployment.
 
 import logging
 import re
+import textwrap
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -113,23 +114,30 @@ class MetricViewValidator:
                                           f"source '{source}' should be fully qualified (catalog.schema.table)",
                                           "source"))
 
-        # joins
+        # joins (recursive — nested joins model snowflake schemas)
         join_names = set()
-        for idx, j in enumerate(doc.get("joins", [])):
-            loc = f"joins[{idx}]"
-            if not isinstance(j, dict):
-                issues.append(ValidationIssue("error", "yaml_structure",
-                                              "Join entry must be a mapping", loc))
-                continue
-            for req in ("name", "source", "on"):
-                if req not in j:
+
+        def _check_joins(join_list, prefix):
+            for idx, j in enumerate(join_list):
+                loc = f"{prefix}[{idx}]"
+                if not isinstance(j, dict):
                     issues.append(ValidationIssue("error", "yaml_structure",
-                                                  f"Missing required field '{req}'", f"{loc}.{req}"))
-            name = j.get("name", "")
-            if name in join_names:
-                issues.append(ValidationIssue("error", "yaml_structure",
-                                              f"Duplicate join name '{name}'", loc))
-            join_names.add(name)
+                                                  "Join entry must be a mapping", loc))
+                    continue
+                for req in ("name", "source", "on"):
+                    if req not in j:
+                        issues.append(ValidationIssue("error", "yaml_structure",
+                                                      f"Missing required field '{req}'", f"{loc}.{req}"))
+                name = j.get("name", "")
+                if name in join_names:
+                    issues.append(ValidationIssue("error", "yaml_structure",
+                                                  f"Duplicate join name '{name}'", loc))
+                join_names.add(name)
+                nested = j.get("joins")
+                if isinstance(nested, list):
+                    _check_joins(nested, f"{loc}.joins")
+
+        _check_joins(doc.get("joins", []), "joins")
 
         # dimensions
         dim_names = set()
@@ -179,12 +187,21 @@ class MetricViewValidator:
             expr_issues = self._validate_expr(expr, f"{loc}.expr")
             issues.extend(expr_issues)
 
-            # Validate window spec
+            # Validate window spec. The spec shape is a list of window mappings;
+            # a bare mapping is tolerated for backward compatibility.
             window = m.get("window")
-            if window and isinstance(window, dict):
-                if "range" not in window:
-                    issues.append(ValidationIssue("warning", "yaml_structure",
-                                                  f"Window missing 'range'", f"{loc}.window"))
+            if window:
+                window_items = window if isinstance(window, list) else [window]
+                for widx, w in enumerate(window_items):
+                    if not isinstance(w, dict):
+                        issues.append(ValidationIssue("error", "yaml_structure",
+                                                      "Window entry must be a mapping",
+                                                      f"{loc}.window[{widx}]"))
+                        continue
+                    if "range" not in w:
+                        issues.append(ValidationIssue("warning", "yaml_structure",
+                                                      "Window missing 'range'",
+                                                      f"{loc}.window[{widx}]"))
 
         # Cross-reference: join aliases used in expressions
         issues.extend(self._check_join_references(doc, join_names))
@@ -220,15 +237,17 @@ class MetricViewValidator:
             issues.append(ValidationIssue("error", "ddl",
                                           "Missing LANGUAGE YAML clause"))
 
-        # Extract YAML from $$ ... $$
-        yaml_match = re.search(r'\$\$\s*\n?(.*?)\n?\s*\$\$', ddl, re.DOTALL)
+        # Extract YAML from $$ ... $$. Consume only trailing spaces/tabs after
+        # the opening `$$` (not the first content line's indentation) so the
+        # captured body keeps a uniform indent that textwrap.dedent can remove.
+        yaml_match = re.search(r'\$\$[ \t]*\n(.*?)\n[ \t]*\$\$', ddl, re.DOTALL)
         if not yaml_match:
             issues.append(ValidationIssue("error", "ddl",
                                           "Missing $$ delimited YAML body"))
             return ValidationResult(valid=any(i.severity != "error" for i in issues),
                                     issues=issues)
 
-        yaml_body = yaml_match.group(1)
+        yaml_body = textwrap.dedent(yaml_match.group(1))
         yaml_result = self.validate_yaml(yaml_body)
         issues.extend(yaml_result.issues)
 
@@ -245,6 +264,12 @@ class MetricViewValidator:
         """Find remaining DAX patterns that weren't translated."""
         found = []
         for func in RESIDUAL_DAX_FUNCS:
+            if func == "FILTER":
+                # SQL `FILTER (WHERE ...)` on a measure is valid Databricks
+                # syntax, not residual DAX — only flag DAX FILTER( calls.
+                if re.search(r'\bFILTER\s*\((?!\s*WHERE\b)', expr, re.IGNORECASE):
+                    found.append(func)
+                continue
             if re.search(rf'\b{func}\s*\(', expr, re.IGNORECASE):
                 found.append(func)
         if RE_TABLE_COL.search(expr):
