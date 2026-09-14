@@ -181,7 +181,9 @@ def test_generator_excludes_residual_dax_measures():
     assert "Bad" in spec.excluded_measures  # {name: reason}
 
 
-def test_generator_excludes_window_over_window():
+def test_generator_pushes_down_window_over_window():
+    """A prior-period-of-windowed measure (LY of MTD) is rebuilt via offset
+    pushdown — kept, not excluded — with an offset copy of the windowed leaf."""
     gen = MetricViewYAMLGenerator()
     spec = gen.build_spec(
         "M", "Sales", "main", "s", tables=[{"name": "Sales", "columns": [], "measures": []}],
@@ -191,8 +193,80 @@ def test_generator_excludes_window_over_window():
             {"name": "LY MTD", "translated_sql": "MEASURE(`MTD`)", "window": [{"order": "d", "range": "trailing", "offset": "-1 year"}]},
         ],
     )
+    by_name = {m.name: m for m in spec.measures}
+    assert "LY MTD" not in spec.excluded_measures            # no longer excluded
+    ly = by_name["LY MTD"]
+    assert ly.window is None                                 # now a windowless composition
+    off = by_name["MTD__off_1_year"]                         # offset copy of the leaf
+    assert off.expr == "SUM(source.amt)"
+    assert any(w.get("offset") == "-1 year" for w in off.window)
+    assert "MTD__off_1_year" in ly.expr
+    assert any("offset pushdown" in w for w in spec.build_warnings)
+
+
+def _spec_with(measures):
+    return MetricViewYAMLGenerator().build_spec(
+        "M", "Sales", "main", "s", tables=[{"name": "Sales", "columns": [], "measures": []}],
+        relationships=[], translated_measures=measures)
+
+
+def test_pushdown_additive_prior_period():
+    """SPLY of a simple additive windowed measure is kept via pushdown."""
+    spec = _spec_with([
+        {"name": "MTD Sales", "translated_sql": "SUM(source.amt)", "window": [{"order": "d", "range": "cumulative"}]},
+        {"name": "SPLY MTD Sales", "translated_sql": "MEASURE(`MTD Sales`)", "window": [{"order": "d", "range": "trailing", "offset": "-1 year"}]},
+    ])
     names = [m.name for m in spec.measures]
-    assert "MTD" in names and "LY MTD" not in names
+    assert "SPLY MTD Sales" in names and "SPLY MTD Sales" not in spec.excluded_measures
+    assert "MTD Sales__off_1_year" in names
+
+
+def test_pushdown_dedups_shared_offset_leaf():
+    """Two prior-period measures over the same leaf share one offset copy."""
+    spec = _spec_with([
+        {"name": "MTD", "translated_sql": "SUM(source.amt)", "window": [{"order": "d", "range": "cumulative"}]},
+        {"name": "LY A", "translated_sql": "MEASURE(`MTD`)", "window": [{"order": "d", "range": "trailing", "offset": "-1 year"}]},
+        {"name": "LY B", "translated_sql": "MEASURE(`MTD`) * 2", "window": [{"order": "d", "range": "trailing", "offset": "-1 year"}]},
+    ])
+    off_copies = [m.name for m in spec.measures if m.name.startswith("MTD__off_")]
+    assert off_copies == ["MTD__off_1_year"]  # created once, shared
+
+
+def test_depends_on_excluded_names_the_dependency():
+    """A measure dropped for referencing an excluded measure names which one."""
+    spec = _spec_with([
+        {"name": "Daily GP %", "translated_sql": "CALCULATE(SUM(source.gp), VALUES(source.x))"},  # residual -> excluded
+        {"name": "MTD GP %", "translated_sql": "MEASURE(`Daily GP %`)", "window": [{"order": "d", "range": "cumulative"}]},
+    ])
+    assert spec.excluded_measures["MTD GP %"].endswith("Daily GP %")
+    assert "references a measure that was excluded" in spec.excluded_measures["MTD GP %"]
+
+
+def test_pushdown_disabled_by_option():
+    """With convert_nested_windows=False, prior-period measures are excluded
+    (window-over-window) rather than rewritten."""
+    gen = MetricViewYAMLGenerator()
+    tms = [
+        {"name": "MTD", "translated_sql": "SUM(source.amt)", "window": [{"order": "d", "range": "cumulative"}]},
+        {"name": "LY MTD", "translated_sql": "MEASURE(`MTD`)", "window": [{"order": "d", "range": "trailing", "offset": "-1 year"}]},
+    ]
+    spec = gen.build_spec("M", "Sales", "main", "s",
+        tables=[{"name": "Sales", "columns": [], "measures": []}],
+        relationships=[], translated_measures=tms, convert_nested_windows=False)
+    assert "LY MTD" in spec.excluded_measures
+    assert not any(m.name.startswith("MTD__off_") for m in spec.measures)
+
+
+def test_pushdown_aborts_on_windowed_composition():
+    """A prior-period over a windowed *composition* can't be pushed down and is
+    still excluded (falls back to the window-over-window rule)."""
+    spec = _spec_with([
+        {"name": "Base", "translated_sql": "SUM(source.amt)", "window": [{"order": "d", "range": "cumulative"}]},
+        {"name": "WComp", "translated_sql": "MEASURE(`Base`)", "window": [{"order": "d", "range": "cumulative"}]},
+        {"name": "PP", "translated_sql": "MEASURE(`WComp`)", "window": [{"order": "d", "range": "trailing", "offset": "-1 year"}]},
+    ])
+    assert "PP" in spec.excluded_measures
+    assert "PP" not in [m.name for m in spec.measures]
 
 
 # ── E4: row-level security ──────────────────────────────────────────────────

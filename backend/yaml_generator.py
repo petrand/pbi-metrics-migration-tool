@@ -76,6 +76,9 @@ class MetricViewSpec:
     view_name: str = ""
     # measure name -> reason it was excluded from the deployed view
     excluded_measures: dict = field(default_factory=dict)
+    # verify/notes emitted during spec construction (e.g. offset-pushdown
+    # calendar-alignment warnings) — surfaced by the pipeline as warnings.
+    build_warnings: list = field(default_factory=list)
 
 
 def _sanitize_name(name: str) -> str:
@@ -212,6 +215,7 @@ class MetricViewYAMLGenerator:
         relationships: list,
         translated_measures: list,
         overrides=None,
+        convert_nested_windows: bool = True,
     ) -> MetricViewSpec:
         """Build a MetricViewSpec from semantic model components.
 
@@ -367,6 +371,18 @@ class MetricViewYAMLGenerator:
                     name=order, expr=f"source.{order}"))
                 dim_by_lower[str(order).lower()] = order
 
+        # Prior-period of a windowed measure (e.g. SPLY of MTD GP %) arrives as a
+        # measure whose window carries an `offset` and whose expr references
+        # another windowed measure — a window-over-window that can't deploy.
+        # Deterministically rewrite it (Option A / "offset pushdown"): push the
+        # offset onto offset-copies of the windowed leaves and leave this measure
+        # as a windowless composition. Whatever can't be rewritten is left for
+        # _drop_window_chains to exclude. Gated by the "convert nested window
+        # measures" option; when off, these fall through to exclusion.
+        if convert_nested_windows:
+            spec.measures, pushdown_warnings = self._pushdown_offsets(spec.measures)
+            spec.build_warnings.extend(pushdown_warnings)
+
         # Metric Views forbid a window measure from referencing another window
         # measure (chained time-intelligence like LY-of-MTD). Exclude such
         # measures iteratively so no retained measure references a dropped one;
@@ -379,8 +395,12 @@ class MetricViewYAMLGenerator:
         # any measure that references a measure not present in the view (e.g.
         # one excluded as residual DAX). Iterate to a fixed point.
         spec.measures, dropped_dangling = self._resolve_measure_refs(spec.measures)
-        for n in dropped_dangling:
-            excluded[n] = "references a measure that was excluded from the view"
+        for n, deps in dropped_dangling.items():
+            dep_str = ", ".join(deps)
+            excluded[n] = (
+                f"references a measure that was excluded from the view: {dep_str}"
+                if dep_str else "references a measure that was excluded from the view"
+            )
         # Metric Views require a referenced measure to be defined before it is
         # used, so order measures topologically by their MEASURE() dependencies
         # (base measures first). Independents keep their original order; cycles
@@ -416,16 +436,21 @@ class MetricViewYAMLGenerator:
 
     @staticmethod
     def _resolve_measure_refs(measures: list) -> tuple:
-        """Fix MEASURE() reference casing and drop measures with dangling refs."""
+        """Fix MEASURE() reference casing and drop measures with dangling refs.
+
+        Returns ``(kept, dropped)`` where ``dropped`` maps each dropped measure
+        name to the sorted list of referenced measures that are missing from the
+        view (the dependencies that caused its exclusion).
+        """
         kept = list(measures)
-        dropped: list = []
+        dropped: dict = {}
         ref_re = re.compile(r"MEASURE\(`([^`]+)`\)")
         changed = True
         while changed:
             changed = False
             by_lower = {m.name.lower(): m.name for m in kept}
             names = set(by_lower.values())
-            invalid = set()
+            missing: dict = {}   # measure name -> set of missing referenced names
             for m in kept:
                 for ref in ref_re.findall(m.expr or ""):
                     if ref in names:
@@ -434,12 +459,151 @@ class MetricViewYAMLGenerator:
                     if actual:
                         m.expr = m.expr.replace(f"MEASURE(`{ref}`)", f"MEASURE(`{actual}`)")
                     else:
-                        invalid.add(m.name)
-            if invalid:
-                dropped.extend(sorted(invalid))
-                kept = [m for m in kept if m.name not in invalid]
+                        missing.setdefault(m.name, set()).add(ref)
+            if missing:
+                for name, refs in missing.items():
+                    dropped[name] = sorted(refs)
+                kept = [m for m in kept if m.name not in missing]
                 changed = True
         return kept, dropped
+
+    _MEASURE_REF = re.compile(r"MEASURE\(`([^`]+)`\)")
+
+    @staticmethod
+    def _offset_slug(offset) -> str:
+        return re.sub(r'[^a-z0-9]+', '_', str(offset).lower()).strip('_') or "off"
+
+    def _pushdown_offsets(self, measures: list) -> tuple:
+        """Rewrite 'prior-period of a windowed measure' into offset-pushed leaves.
+
+        A measure whose window carries an ``offset`` and whose expr references
+        other measures (e.g. ``MEASURE(`MTD GP %`)`` with ``offset: -1 year``) is
+        a window-over-window. Deterministically rebuild it: for every windowed
+        measure it (transitively) references, synthesize an offset copy
+        (same base expression + same window + the offset merged in), remap the
+        references, and drop this measure's own window so it becomes a windowless
+        composition. Aborts (leaving the measure unchanged for _drop_window_chains
+        to exclude) when a referenced node can't be classified as a windowed base
+        leaf or a windowless composition.
+
+        Returns ``(measures, warnings)``.
+        """
+        ref_re = self._MEASURE_REF
+        by_name = {m.name: m for m in measures}
+        added: dict = {}          # new_name -> MetricViewMeasure (offset copies)
+        created: dict = {}        # (name.lower(), offset_slug) -> new_name
+        warnings: list = []
+
+        class _Abort(Exception):
+            pass
+
+        def _lookup(name):
+            return by_name.get(name) or added.get(name) or next(
+                (v for k, v in {**by_name, **added}.items() if k.lower() == name.lower()), None)
+
+        def has_time_component(m, seen=None):
+            # True if the measure (or anything it references) carries a window —
+            # i.e. it has a time frame the offset can shift. A plain aggregate
+            # (no window, no windowed refs) has none.
+            seen = seen or set()
+            if m is None or m.name.lower() in seen:
+                return False
+            seen.add(m.name.lower())
+            if m.window:
+                return True
+            return any(has_time_component(_lookup(r), seen)
+                       for r in ref_re.findall(m.expr or ""))
+
+        def merge_offset(window, offset):
+            items = window if isinstance(window, list) else [window]
+            out = []
+            for w in items:
+                if not isinstance(w, dict):
+                    raise _Abort("non-dict window")
+                w = dict(w)
+                existing = w.get("offset")
+                if existing and str(existing) != str(offset):
+                    raise _Abort("nested/conflicting offset")
+                w["offset"] = offset
+                out.append(w)
+            return out
+
+        def offset_version(name, offset):
+            key = (name.lower(), self._offset_slug(offset))
+            if key in created:
+                return created[key]
+            m = _lookup(name)
+            if m is None:
+                raise _Abort(f"unresolved reference '{name}'")
+            refs = set(ref_re.findall(m.expr or ""))
+            new_name = f"{m.name}__off_{self._offset_slug(offset)}"
+            if m.window and not refs:
+                # Windowed leaf (base aggregate / arithmetic of aggregates):
+                # copy with the offset merged into the window.
+                new = MetricViewMeasure(name=new_name, expr=m.expr,
+                                        window=merge_offset(m.window, offset),
+                                        format=m.format)
+            elif m.window and refs:
+                # Windowed composition (a window over MEASURE()s, e.g. MTD Sales =
+                # cumulative over Daily Sales). The outer window carries the offset
+                # and governs which rows the body aggregates, so the body is kept
+                # as-is — UNLESS a referenced measure is itself windowed (nested
+                # window shift), which is ambiguous → abort.
+                for r in refs:
+                    if has_time_component(_lookup(r)):
+                        raise _Abort(f"nested windowed reference in '{name}'")
+                new = MetricViewMeasure(name=new_name, expr=m.expr,
+                                        window=merge_offset(m.window, offset),
+                                        format=m.format)
+            elif refs:
+                # Windowless composition: shift each referenced measure that has a
+                # time component; a plain non-time base ref can't be shifted.
+                new_expr = m.expr
+                touched = False
+                for ref in refs:
+                    if has_time_component(_lookup(ref)):
+                        child = offset_version(ref, offset)
+                        new_expr = new_expr.replace(f"MEASURE(`{ref}`)", f"MEASURE(`{child}`)")
+                        touched = True
+                if not touched:
+                    raise _Abort(f"no time component to offset in '{name}'")
+                new = MetricViewMeasure(name=new_name, expr=new_expr, window=None,
+                                        format=m.format)
+            else:
+                raise _Abort(f"cannot offset non-time base measure '{name}'")
+            added[new_name] = new
+            created[key] = new_name
+            return new_name
+
+        for m in list(measures):
+            if not m.window:
+                continue
+            witems = m.window if isinstance(m.window, list) else [m.window]
+            offsets = {str(w.get("offset")) for w in witems
+                       if isinstance(w, dict) and w.get("offset")}
+            refs = set(ref_re.findall(m.expr or ""))
+            # Only prior-period-over-a-windowed-measure qualifies: an offset window
+            # AND a reference to a measure that is itself windowed.
+            if not refs or len(offsets) != 1:
+                continue
+            if not any(has_time_component(_lookup(r)) for r in refs):
+                continue
+            offset = witems[0].get("offset")
+            try:
+                new_expr = m.expr
+                for ref in refs:
+                    child = offset_version(ref, offset)
+                    new_expr = new_expr.replace(f"MEASURE(`{ref}`)", f"MEASURE(`{child}`)")
+            except _Abort:
+                continue  # leave unchanged; _drop_window_chains will exclude it
+            m.expr = new_expr
+            m.window = None
+            warnings.append(
+                f"{m.name}: prior-period rebuilt via offset pushdown ({offset}); "
+                "verify calendar alignment"
+            )
+
+        return measures + list(added.values()), warnings
 
     @staticmethod
     def _drop_window_chains(measures: list) -> tuple:
@@ -767,6 +931,7 @@ class MetricViewYAMLGenerator:
         catalog: str,
         schema: str,
         overrides=None,
+        convert_nested_windows: bool = True,
     ) -> list:
         """Generate metric view specs for all fact groups in a model.
 
@@ -816,6 +981,7 @@ class MetricViewYAMLGenerator:
                 relationships=relationships,
                 translated_measures=measures,
                 overrides=overrides,
+                convert_nested_windows=convert_nested_windows,
             )
             # A Metric View must define at least one measure or dimension.
             # After excluding residual/window measures a fact group can end up

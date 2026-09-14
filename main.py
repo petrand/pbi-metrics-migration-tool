@@ -326,6 +326,7 @@ def run_migration(body: dict = {}):
         deploy=body.get("deploy", False),
         dry_run=body.get("dry_run", False),
         validate_only=body.get("validate_only", False),
+        convert_nested_windows=body.get("convert_nested_windows", True),
         generate_dashboard=body.get("generate_dashboard", False),
         dashboard_name=body.get("dashboard_name", ""),
     )

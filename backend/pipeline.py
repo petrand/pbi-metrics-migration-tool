@@ -34,6 +34,7 @@ class MigrationConfig:
     dry_run: bool = False
     validate_only: bool = False
     overrides: Optional[Overrides] = None
+    convert_nested_windows: bool = True
     generate_dashboard: bool = False
     dashboard_name: str = ""
 
@@ -226,6 +227,7 @@ class MigrationPipeline:
                        "relationships": relationships},
                 catalog=config.catalog,
                 schema=config.schema,
+                convert_nested_windows=config.convert_nested_windows,
             )
             # Keyed by sanitized source table so the evaluate step can attach
             # per-view info: excluded measures + converted dimension columns.
@@ -243,6 +245,10 @@ class MigrationPipeline:
                 ]
                 # Measures that actually made it into this deployable view.
                 deployed_by_source[src_key] = {m.name for m in getattr(spec, "measures", [])}
+                # Surface build-time notes (e.g. offset-pushdown calendar-alignment
+                # verify warnings) so they aren't lost.
+                for note in getattr(spec, "build_warnings", []) or []:
+                    result.warnings.append(f"{group_name}: {note}")
             # Fact groups whose view was skipped entirely still carry exclusions
             # that must be surfaced — merge them so no drop goes unreported.
             for src_key, excl in getattr(self.yaml_gen, "skipped_exclusions", {}).items():

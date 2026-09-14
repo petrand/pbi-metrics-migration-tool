@@ -66,7 +66,7 @@ function classifyExclusion(m) {
   const reason = (m.exclusion_reason || '').toLowerCase();
   const dax = m.original_dax || '';
   if (reason.includes('non-aggregating')) return 'Non-aggregating';
-  if (reason.includes('window-over-window')) return 'Time intelligence';
+  if (reason.includes('window-over-window')) return 'Prior-period of windowed measure';
   if (reason.includes('references a measure')) return 'Depends on excluded measure';
   if (reason.includes('excluded upstream')) return 'Excluded upstream';
   // Residual-DAX (or unknown) — inspect the original expression.
@@ -74,6 +74,61 @@ function classifyExclusion(m) {
   if (_FILTER_CTX.test(dax)) return 'Filter/context DAX';
   if (dax.includes('[')) return 'Unresolved reference';
   return 'No SQL analog';
+}
+
+// A measure benefits from a manual override when it didn't cleanly deploy:
+// excluded from the view, or only partially / not translated.
+function needsOverride(m) {
+  return m.deployed === false || m.status === 'partial' || m.status === 'unsupported';
+}
+
+// Generate a suggested `measure_override` YAML stub so the user can compare the
+// default (auto) conversion with a hand-tunable override.
+function suggestedOverride(m) {
+  const name = m.name;
+  const dax = m.original_dax || '';
+  const sql = m.translated_sql || '';
+  const cat = m.deployed === false
+    ? classifyExclusion(m)
+    : (m.status === 'partial' ? 'Partial translation' : 'Untranslatable');
+  if ((m.exclusion_reason || '').includes('window-over-window')) {
+    return `# ${cat}: rebuild via offset on base components, then compose
+- name: <base>_py
+  expr: <base aggregate>            # e.g. SUM(source.gross_profit)
+  window: [{ order: Date, range: cumulative, offset: -12 month }]
+- name: ${name}
+  expr: MEASURE(<num>_py) / NULLIF(MEASURE(<den>_py), 0)`;
+  }
+  if (cat === 'Non-aggregating') {
+    return `# ${cat}: wrap in an explicit aggregate
+- name: ${name}
+  expr: SUM(${sql || '<column>'})
+  # original DAX: ${dax}`;
+  }
+  if (cat === 'Time intelligence') {
+    return `# ${cat}: express as a window on the base measure
+- name: ${name}
+  expr: ${sql || '<base aggregate>'}
+  window: [{ order: Date, range: cumulative }]
+  # original DAX: ${dax}`;
+  }
+  return `# ${cat}: hand-translate the DAX to SQL
+- name: ${name}
+  expr: ${sql || '<SQL expression>'}
+  # original DAX: ${dax}`;
+}
+
+function OverrideStub({ m }) {
+  return (
+    <div style={{ margin: '2px 0 8px', padding: '8px 10px', borderRadius: 6, background: 'rgba(99,102,241,0.08)', borderLeft: '3px solid #6366f1' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+        <span style={{ fontSize: 10, textTransform: 'uppercase', color: '#a5b4fc', fontWeight: 700 }}>Suggested measure_override</span>
+        <button className="btn-secondary" style={{ fontSize: 10, padding: '2px 8px' }}
+          onClick={(e) => { e.stopPropagation(); navigator.clipboard?.writeText(suggestedOverride(m)); }}>Copy</button>
+      </div>
+      <code style={{ display: 'block', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: '#c7d2fe', fontSize: 11, lineHeight: 1.5 }}>{suggestedOverride(m)}</code>
+    </div>
+  );
 }
 
 function ConfidenceBar({ value }) {
@@ -89,11 +144,27 @@ function ConfidenceBar({ value }) {
   );
 }
 
-function MeasureDetail({ m }) {
+// The measures this one references (via MEASURE()) that were themselves
+// excluded from the view — computed from the group so it's always accurate.
+function excludedDeps(m, groupMeasures) {
+  const refs = [...String(m.translated_sql || '').matchAll(/MEASURE\(`([^`]+)`\)/g)].map(x => x[1]);
+  const byName = {};
+  (groupMeasures || []).forEach(x => { byName[x.name.toLowerCase()] = x; });
+  const seen = new Set();
+  const out = [];
+  refs.forEach(r => {
+    const dep = byName[r.toLowerCase()];
+    if (dep && dep.deployed === false && !seen.has(r.toLowerCase())) { seen.add(r.toLowerCase()); out.push(dep.name); }
+  });
+  return out;
+}
+
+function MeasureDetail({ m, groupMeasures }) {
   const rows = [
     ['Original DAX', m.original_dax, '#fbbf24'],
     ['Translated SQL', m.translated_sql, '#4ade80'],
   ];
+  const deps = excludedDeps(m, groupMeasures);
   const hasWindow = m.window_spec && (Array.isArray(m.window_spec) ? m.window_spec.length > 0 : Object.keys(m.window_spec).length > 0);
   return (
     <div style={{ padding: '10px 14px 14px 34px', background: 'rgba(0,0,0,0.18)', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
@@ -101,8 +172,17 @@ function MeasureDetail({ m }) {
         <div style={{ marginBottom: 10, padding: '8px 10px', borderRadius: 6, background: 'rgba(148,163,184,0.12)', borderLeft: '3px solid #94a3b8' }}>
           <span style={{ fontSize: 11, fontWeight: 700, color: '#cbd5e1' }}>⊘ Excluded from the deployed view</span>
           <div style={{ fontSize: 11.5, color: '#94a3b8', marginTop: 2 }}>{m.exclusion_reason || 'not deployable'} — candidate for a manual measure_override.</div>
+          {deps.length > 0 && (
+            <div style={{ fontSize: 11.5, marginTop: 4 }}>
+              <span style={{ color: '#64748b' }}>Depends on excluded: </span>
+              {deps.map((d, i) => (
+                <span key={d} style={{ color: '#f0abfc', fontWeight: 600 }}>{d}{i < deps.length - 1 ? ', ' : ''}</span>
+              ))}
+            </div>
+          )}
         </div>
       )}
+      {needsOverride(m) && <OverrideStub m={m} />}
       {rows.map(([label, val, color]) => (
         <div key={label} style={{ marginBottom: 8 }}>
           <div style={{ fontSize: 10, textTransform: 'uppercase', color: '#64748b', marginBottom: 3 }}>{label}</div>
@@ -132,12 +212,181 @@ function MeasureDetail({ m }) {
   );
 }
 
+// Dependency graph of the "depends on excluded measure" cascades: nodes are
+// measures, an edge A→B means A references B. Laid out in columns by dependency
+// depth (root causes on the left), color-coded root-cause / cascade / deployed.
+function DependencyGraph({ measures, onPick }) {
+  const [selected, setSelected] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const byName = {};
+  (measures || []).forEach(m => { byName[m.name.toLowerCase()] = m; });
+  const depsOf = (m) => [...String(m.translated_sql || '').matchAll(/MEASURE\(`([^`]+)`\)/g)]
+    .map(x => byName[x[1].toLowerCase()]).filter(Boolean);
+
+  // Subgraph: measures excluded because of another excluded measure, plus their
+  // transitive dependencies (so the root cause is visible).
+  const inGraph = new Map();
+  const seed = (measures || []).filter(m => m.deployed === false && depsOf(m).some(d => d.deployed === false));
+  const stack = [...seed];
+  while (stack.length) {
+    const m = stack.pop();
+    if (inGraph.has(m.name)) continue;
+    inGraph.set(m.name, m);
+    depsOf(m).forEach(d => { if (!inGraph.has(d.name)) stack.push(d); });
+  }
+  const nodes = [...inGraph.values()];
+  if (nodes.length === 0) {
+    return <div className="glass" style={{ padding: 16, color: '#64748b', fontSize: 13 }}>No cascaded exclusions in this view.</div>;
+  }
+
+  // Longest-path level to a sink (a node with no in-graph dependencies).
+  const level = {};
+  const compute = (name, seen) => {
+    if (name in level) return level[name];
+    if (seen.has(name)) return 0;
+    const ds = depsOf(inGraph.get(name)).filter(d => inGraph.has(d.name));
+    const v = ds.length === 0 ? 0 : 1 + Math.max(...ds.map(d => compute(d.name, new Set(seen).add(name))));
+    level[name] = v;
+    return v;
+  };
+  nodes.forEach(m => compute(m.name, new Set()));
+
+  // Degree of connectivity: dependencies it has (out) + measures depending on it
+  // (in). Used to order each column so the most-connected nodes sit at the top.
+  const outDeg = {}, inDeg = {};
+  nodes.forEach(m => {
+    const ds = depsOf(m).filter(d => inGraph.has(d.name));
+    outDeg[m.name] = ds.length;
+    ds.forEach(d => { inDeg[d.name] = (inDeg[d.name] || 0) + 1; });
+  });
+  const degree = (n) => (outDeg[n] || 0) + (inDeg[n] || 0);
+
+  const cols = {};
+  nodes.forEach(m => { (cols[level[m.name]] = cols[level[m.name]] || []).push(m); });
+  const maxLevel = Math.max(...nodes.map(m => level[m.name]));
+  const COLW = 210, ROWH = 44, NODEW = 176, NODEH = 30, PADX = 14, PADY = 14;
+  const pos = {};
+  let maxRows = 0;
+  for (let l = 0; l <= maxLevel; l++) {
+    const c = (cols[l] || []).slice().sort(
+      (a, b) => degree(b.name) - degree(a.name) || a.name.localeCompare(b.name));
+    maxRows = Math.max(maxRows, c.length);
+    c.forEach((m, i) => { pos[m.name] = { x: PADX + l * COLW, y: PADY + i * ROWH }; });
+  }
+  const width = PADX * 2 + maxLevel * COLW + NODEW;
+  const height = PADY * 2 + Math.max(1, maxRows) * ROWH;
+  const nodeColor = (m) => m.deployed !== false ? '#4ade80'
+    : (String(m.exclusion_reason || '').includes('references a measure') ? '#fbbf24' : '#f87171');
+  const trunc = (s) => s.length > 24 ? s.slice(0, 23) + '…' : s;
+
+  const edges = [];
+  const outAdj = {}, inAdj = {};
+  nodes.forEach(m => depsOf(m).forEach(d => {
+    if (!inGraph.has(d.name)) return;
+    edges.push([m.name, d.name]);
+    (outAdj[m.name] = outAdj[m.name] || []).push(d.name);   // m depends on d
+    (inAdj[d.name] = inAdj[d.name] || []).push(m.name);     // d is depended on by m
+  }));
+
+  // Click-to-highlight: the selected node plus everything it depends on
+  // (downstream) and everything that depends on it (upstream) — its whole chain.
+  const walk = (start, adj) => {
+    const s = new Set(), st = [start];
+    while (st.length) {
+      const n = st.pop();
+      (adj[n] || []).forEach(x => { if (!s.has(x)) { s.add(x); st.push(x); } });
+    }
+    return s;
+  };
+  const hi = (selected && inGraph.has(selected))
+    ? new Set([selected, ...walk(selected, outAdj), ...walk(selected, inAdj)])
+    : null;
+  const nodeOpacity = (name) => hi ? (hi.has(name) ? 1 : 0.15) : 1;
+  const edgeOn = (a, b) => hi && hi.has(a) && hi.has(b);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', fontSize: 10, color: '#94a3b8', alignItems: 'center' }}>
+        <span><span style={{ color: '#f87171' }}>■</span> root cause</span>
+        <span><span style={{ color: '#fbbf24' }}>■</span> cascaded exclusion</span>
+        <span><span style={{ color: '#4ade80' }}>■</span> deployed dependency</span>
+        <span style={{ color: '#64748b' }}>arrow: A → B means A depends on B</span>
+        <span style={{ marginLeft: 'auto', color: '#818cf8' }}>{selected ? `Highlighting “${selected}” — click background to clear` : 'Click a node to highlight its chain · double-click for the exclusion reason'}</span>
+      </div>
+      <div style={{ overflow: 'auto', height: 420, minHeight: 140, resize: 'vertical', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 8, background: 'rgba(0,0,0,0.15)' }}>
+        <svg width={width} height={height} style={{ display: 'block' }} onClick={() => setSelected(null)}>
+          <defs>
+            <marker id="dg-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L8,4 L0,8 z" fill="#64748b" />
+            </marker>
+            <marker id="dg-arrow-hi" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L8,4 L0,8 z" fill="#a5b4fc" />
+            </marker>
+          </defs>
+          {edges.map(([a, b], i) => {
+            const pa = pos[a], pb = pos[b];
+            if (!pa || !pb) return null;
+            const x1 = pa.x, y1 = pa.y + NODEH / 2;              // dependent left edge
+            const x2 = pb.x + NODEW, y2 = pb.y + NODEH / 2;      // dependency right edge
+            const mx = (x1 + x2) / 2;
+            const on = edgeOn(a, b);
+            const stroke = hi ? (on ? '#a5b4fc' : 'rgba(148,163,184,0.12)') : 'rgba(148,163,184,0.5)';
+            return <path key={i} d={`M${x2},${y2} C${mx},${y2} ${mx},${y1} ${x1},${y1}`}
+              fill="none" stroke={stroke} strokeWidth={on ? 2 : 1.2}
+              markerStart={`url(#${on ? 'dg-arrow-hi' : 'dg-arrow'})`} />;
+          })}
+          {nodes.map(m => {
+            const p = pos[m.name];
+            const c = nodeColor(m);
+            const isSel = selected === m.name;
+            return (
+              <g key={m.name} transform={`translate(${p.x},${p.y})`} style={{ cursor: 'pointer' }}
+                opacity={nodeOpacity(m.name)}
+                onClick={(e) => { e.stopPropagation(); setSelected(m.name); onPick && onPick(m); }}
+                onDoubleClick={(e) => { e.stopPropagation(); setDetail(m); }}>
+                <title>{`${m.name}\n${m.deployed === false ? (m.exclusion_reason || 'excluded') : 'deployed'}\n(double-click for details)`}</title>
+                <rect width={NODEW} height={NODEH} rx="6" fill={`${c}1a`} stroke={isSel ? '#c7d2fe' : c} strokeWidth={isSel ? 2.4 : 1.3} />
+                <text x="9" y={NODEH / 2 + 3.5} fontSize="11" fill="#e2e8f0">{trunc(m.name)}</text>
+              </g>
+            );
+          })}
+        </svg>
+      </div>
+      {detail && (
+        <div className="glass" style={{ padding: '10px 12px', borderLeft: `3px solid ${nodeColor(detail)}` }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <strong style={{ fontSize: 13 }}>{detail.name}</strong>
+            <span className="tag" style={{ fontSize: 9, background: `${nodeColor(detail)}22`, color: nodeColor(detail) }}>{detail.status}</span>
+            {detail.deployed === false && <span style={{ fontSize: 10, color: '#94a3b8' }}>⊘ {classifyExclusion(detail)}</span>}
+            <button className="btn-secondary" style={{ marginLeft: 'auto', fontSize: 10, padding: '2px 8px' }} onClick={() => setDetail(null)}>Close</button>
+          </div>
+          <div style={{ fontSize: 11.5, color: detail.deployed === false ? '#fbbf24' : '#4ade80', marginTop: 4 }}>
+            {detail.deployed === false ? (detail.exclusion_reason || 'excluded from the view') : 'Deployed in the view.'}
+          </div>
+          {excludedDeps(detail, measures).length > 0 && (
+            <div style={{ fontSize: 11, marginTop: 3 }}>
+              <span style={{ color: '#64748b' }}>Depends on excluded: </span>
+              <span style={{ color: '#f0abfc', fontWeight: 600 }}>{excludedDeps(detail, measures).join(', ')}</span>
+            </div>
+          )}
+          <div style={{ marginTop: 6, fontSize: 10, textTransform: 'uppercase', color: '#64748b' }}>Original DAX</div>
+          <code style={{ display: 'block', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: '#fbbf24', fontSize: 11 }}>{detail.original_dax || '—'}</code>
+          <div style={{ marginTop: 4, fontSize: 10, textTransform: 'uppercase', color: '#64748b' }}>Translated SQL</div>
+          <code style={{ display: 'block', whiteSpace: 'pre-wrap', wordBreak: 'break-word', color: '#4ade80', fontSize: 11 }}>{detail.translated_sql || '—'}</code>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ResultsExplorer({ groups, totals }) {
   const [openGroup, setOpenGroup] = useState(null);
   const [openMeasure, setOpenMeasure] = useState(null);
   const [openIssues, setOpenIssues] = useState(null);
   const [measureTab, setMeasureTab] = useState('converted');
   const [excludedCat, setExcludedCat] = useState('all');
+  const [showOverrides, setShowOverrides] = useState(false);
+  const [showGraph, setShowGraph] = useState(false);
   const sorted = [...(groups || [])].sort((a, b) => (b.total_measures || 0) - (a.total_measures || 0));
   const totalMeasures = sorted.reduce((s, g) => s + (g.total_measures || 0), 0);
 
@@ -162,7 +411,13 @@ function ResultsExplorer({ groups, totals }) {
         {chip('Conversion', totals?.overall_conversion_rate != null ? `${totals.overall_conversion_rate}%` : '—', '#a78bfa')}
       </div>
 
-      <div style={{ fontSize: 11, color: '#64748b' }}>Click a fact table to see its measures; click a measure for the DAX → SQL detail.</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <span style={{ fontSize: 11, color: '#64748b' }}>Click a fact table to see its measures; click a measure for the DAX → SQL detail.</span>
+        <label style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: '#94a3b8', cursor: 'pointer' }}>
+          <input type="checkbox" checked={showOverrides} onChange={e => setShowOverrides(e.target.checked)} />
+          Show suggested overrides
+        </label>
+      </div>
 
       {sorted.map(g => {
         const isOpen = openGroup === g.name;
@@ -280,6 +535,10 @@ function ResultsExplorer({ groups, totals }) {
                     <span style={{ fontSize: 10, textTransform: 'uppercase', color: '#64748b', marginRight: 4 }}>Reason</span>
                     {catChip('all', excludedMeasures.length, excludedCat === 'all')}
                     {catNames.map(c => catChip(c, cats[c].length, excludedCat === c))}
+                    <button className="btn-secondary" style={{ marginLeft: 'auto', fontSize: 10, padding: '3px 10px' }}
+                      onClick={(e) => { e.stopPropagation(); setShowGraph(v => !v); }}>
+                      {showGraph ? 'Hide' : 'Show'} dependency graph
+                    </button>
                   </div>
                 );
               }
@@ -294,6 +553,12 @@ function ResultsExplorer({ groups, totals }) {
                     ))}
                   </div>
                   {subFilter}
+                  {measureTab === 'excluded' && showGraph && (
+                    <div style={{ padding: '12px 14px 12px 30px', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+                      <div style={{ fontSize: 10, textTransform: 'uppercase', color: '#64748b', marginBottom: 6 }}>Dependency graph — cascaded exclusions</div>
+                      <DependencyGraph measures={g.measures} />
+                    </div>
+                  )}
                   <div style={{ padding: '6px 14px 6px 30px', display: 'grid', gridTemplateColumns: 'minmax(150px,1fr) minmax(180px,1.6fr) minmax(180px,1.6fr) 90px', gap: 12, fontSize: 10, textTransform: 'uppercase', color: '#64748b', position: 'sticky', top: 0, background: '#202039' }}>
                     <span>Measure</span><span>Original DAX (Power BI)</span><span>Migrated SQL</span><span>Confidence</span>
                   </div>
@@ -318,13 +583,19 @@ function ResultsExplorer({ groups, totals }) {
                               <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 3, alignItems: 'center' }}>
                                 <span className="tag" style={{ fontSize: 9, background: `${color}22`, color }}>{m.status}</span>
                                 {notInView && <span title={m.exclusion_reason} className="tag" style={{ fontSize: 9, background: 'rgba(148,163,184,0.15)', color: '#cbd5e1' }}>⊘ {classifyExclusion(m)}</span>}
+                                {notInView && excludedDeps(m, g.measures).length > 0 && (
+                                  <span title={m.exclusion_reason} style={{ fontSize: 9, color: '#f0abfc' }}>→ {excludedDeps(m, g.measures).join(', ')}</span>
+                                )}
                               </div>
                             </div>
                             <code title={m.original_dax} style={{ ...codeClamp, color: '#fbbf24' }}>{m.original_dax || '—'}</code>
                             <code title={m.translated_sql} style={{ ...codeClamp, color: notInView ? '#94a3b8' : '#4ade80' }}>{m.translated_sql || (notInView ? '(excluded from view)' : '—')}</code>
                             <ConfidenceBar value={m.confidence} />
                           </div>
-                          {mOpen && <MeasureDetail m={m} />}
+                          {!mOpen && showOverrides && needsOverride(m) && (
+                            <div style={{ padding: '0 14px 0 30px' }}><OverrideStub m={m} /></div>
+                          )}
+                          {mOpen && <MeasureDetail m={m} groupMeasures={g.measures} />}
                         </div>
                       );
                     })}
@@ -374,6 +645,7 @@ export default function App() {
   // Migrate config
   const [dbxConfig, setDbxConfig] = useState({ catalog: 'hls_amer_catalog', schema: 'metrics', warehouse_id: '' });
   const [deployDryRun, setDeployDryRun] = useState(false);
+  const [convertNestedWindows, setConvertNestedWindows] = useState(true);
 
   // TMDL upload
   const [tmdlFile, setTmdlFile] = useState(null);
@@ -496,6 +768,7 @@ export default function App() {
         warehouse_id: dbxConfig.warehouse_id,
         deploy: !deployDryRun,
         dry_run: deployDryRun,
+        convert_nested_windows: convertNestedWindows,
       };
       const data = await apiFetch('/api/migrate', { method: 'POST', body: JSON.stringify(payload) });
       setMigrationId(data.migration_id || data.id);
@@ -734,6 +1007,13 @@ export default function App() {
                         )}
                       </div>
                       {tmdlError && <div className="tag tag-error" style={{ marginTop: 12 }}>{tmdlError}</div>}
+                      <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 16, fontSize: 13, color: '#94a3b8', cursor: 'pointer' }}>
+                        <input type="checkbox" style={{ marginTop: 2 }} checked={convertNestedWindows} onChange={e => setConvertNestedWindows(e.target.checked)} />
+                        <span>
+                          Convert nested window measures
+                          <div style={{ fontSize: 11, color: '#64748b' }}>Some measures layer one time calculation on top of another — for example last year's month-to-date, which compares a running total to the same point a year earlier. When enabled, these are rebuilt so they land in the view; when off, they're left out and flagged for manual review.</div>
+                        </span>
+                      </label>
                     </motion.div>
                   )}
 
