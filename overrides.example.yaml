@@ -97,10 +97,17 @@ merge_fact_groups:
 #   expr    - the SQL expression (use "source" as the table alias)
 #   comment - optional note stored alongside the metric view definition
 # ---------------------------------------------------------------------------
+#   display_name - human-readable label shown in downstream tools (dashboards, Genie)
+#   synonyms     - alternate names that improve Genie / Genie-Code accuracy
+#   format       - Metric View format object, e.g. {type: currency, currency_code: USD}
+#   window       - Metric View window list, e.g. [{order: order_date, range: "trailing 7 day", semiadditive: last}]
 measure_overrides:
   "Complex KPI":
     expr: "SUM(source.revenue) / NULLIF(COUNT(DISTINCT source.customer_id), 0)"
     comment: "Manually translated — auto-translation of DIVIDE() was ambiguous"
+    display_name: "Revenue per Customer"
+    synonyms: ["ARPU", "revenue per account"]
+    format: {type: currency, currency_code: USD}
   "YTD Revenue":
     expr: "SUM(CASE WHEN YEAR(source.order_date) = YEAR(CURRENT_DATE) THEN source.revenue ELSE 0 END)"
     comment: "DAX DATESYTD replaced with inline CASE expression"
@@ -114,6 +121,7 @@ dimension_overrides:
   ProductName:
     display_name: "Product"
     description: "Product display name from DimProduct"
+    synonyms: ["item", "sku name"]
   CustomerSegment:
     display_name: "Customer Segment"
     description: "Segment classification from DimCustomer"

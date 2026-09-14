@@ -80,6 +80,14 @@ RE_MEASURE_REF = re.compile(r'\[([^\]]+)\]')
 RE_AND_OP = re.compile(r'&&')
 RE_OR_OP = re.compile(r'\|\|')
 
+# SQL keywords that can immediately precede a ``[ref]`` after conditional/logical
+# translation. When one of these is captured as a Table[Column] "table" name,
+# the reference is really a bare [measure]/column, not a table reference.
+_SQL_KEYWORDS = frozenset({
+    "CASE", "WHEN", "THEN", "ELSE", "END", "AND", "OR", "NOT", "IN", "LIKE",
+    "WHERE", "FILTER", "BY", "ON", "AS", "IS", "NULL", "BETWEEN", "DISTINCT",
+})
+
 
 class DAXTranslator:
     """Translates DAX expressions to Databricks SQL for metric views."""
@@ -225,6 +233,11 @@ class DAXTranslator:
 
     def _pass_normalize(self, sql: str) -> str:
         """Normalize whitespace and formatting."""
+        # Strip TMDL triple-backtick code fences that wrap multi-line measures.
+        sql = sql.replace('```', ' ')
+        # Drop a trailing measure property (e.g. "isHidden") the parser may have
+        # appended to a fenced expression.
+        sql = re.sub(r'\bisHidden\b\s*$', '', sql, flags=re.IGNORECASE)
         sql = re.sub(r'\s+', ' ', sql).strip()
         # Remove trailing semicolons
         sql = sql.rstrip(';').strip()
@@ -310,26 +323,88 @@ class DAXTranslator:
 
         return sql
 
+    # DAX time-intelligence functions, grouped by the Metric View window they map
+    # to. Cumulative (*TD) periods become a cumulative window; prior-period
+    # comparisons become a window with a period `offset`.
+    _TI_CUMULATIVE = {
+        "TOTALYTD": "year", "DATESYTD": "year",
+        "TOTALQTD": "quarter", "DATESQTD": "quarter",
+        "TOTALMTD": "month", "DATESMTD": "month",
+    }
+    _TI_PRIOR_YEAR = ("SAMEPERIODLASTYEAR", "PREVIOUSYEAR", "PARALLELPERIOD")
+
     def _extract_window_spec(self, dax_expr: str) -> Optional[dict]:
-        """Extract window specification from time intelligence DAX."""
-        if re.search(r'\bTOTALYTD\b', dax_expr, re.IGNORECASE):
-            # Find the date column
-            m = re.search(r'\bTOTALYTD\s*\(.+?,\s*(.+?)\)', dax_expr, re.IGNORECASE)
-            date_col = "date"
-            if m:
-                ref = m.group(1).strip().strip("'")
-                col_m = RE_TABLE_COL.search(ref)
-                if col_m:
-                    date_col = col_m.group(2).lower().replace(" ", "_")
-            return {"range": "cumulative", "order_by": date_col, "group_by": "year"}
+        """Extract a Metric View window spec from time-intelligence DAX.
 
-        if re.search(r'\bTOTALMTD\b', dax_expr, re.IGNORECASE):
-            return {"range": "cumulative", "order_by": "date", "group_by": "month"}
+        Handles both the wrapper form (``TOTALYTD(m, dates)``) and the
+        ``CALCULATE(m, DATESYTD(dates) | SAMEPERIODLASTYEAR(dates))`` form. Returns
+        a dict with the spec keys (order / range / semiadditive / offset); the
+        YAML generator renders it as a window list. ``None`` when no
+        time-intelligence is present.
+        """
+        # Cumulative period-to-date windows.
+        for func, period in self._TI_CUMULATIVE.items():
+            if re.search(rf'\b{func}\b', dax_expr, re.IGNORECASE):
+                date_col = self._find_date_column(dax_expr, func)
+                if period != "year":
+                    self._warnings.append(
+                        f"{func} mapped to a cumulative window; verify {period}ly "
+                        "period-reset semantics"
+                    )
+                # A fiscal-year anchor (e.g. DATESYTD(dates, \"30-06\")) can't be
+                # expressed directly in the window — surface it for review.
+                if re.search(r'"\d{1,2}-\d{1,2}"', dax_expr):
+                    self._warnings.append(
+                        "Fiscal-year anchor detected; confirm the source table's "
+                        "date grain reflects the fiscal calendar"
+                    )
+                return {"order": date_col, "range": "cumulative", "semiadditive": "last"}
 
-        if re.search(r'\bTOTALQTD\b', dax_expr, re.IGNORECASE):
-            return {"range": "cumulative", "order_by": "date", "group_by": "quarter"}
+        # Prior-period comparisons -> window offset. Metric View period offsets
+        # are best-effort here; flag for manual verification.
+        for func in self._TI_PRIOR_YEAR:
+            if re.search(rf'\b{func}\b', dax_expr, re.IGNORECASE):
+                date_col = self._find_date_column(dax_expr, func)
+                self._warnings.append(
+                    f"{func} mapped to a prior-year window offset; verify offset "
+                    "semantics or supply a measure_override"
+                )
+                return {"order": date_col, "range": "trailing", "offset": "-1 year",
+                        "semiadditive": "last"}
+
+        # DATEADD(dates, -n, YEAR|MONTH|QUARTER) -> offset window.
+        m = re.search(r'\bDATEADD\s*\(\s*(.+?)\s*,\s*(-?\d+)\s*,\s*(\w+)\s*\)',
+                      dax_expr, re.IGNORECASE)
+        if m:
+            date_col = self._find_date_column(dax_expr, "DATEADD")
+            offset = f"{m.group(2)} {m.group(3).lower()}"
+            self._warnings.append("DATEADD mapped to a window offset; verify offset semantics")
+            return {"order": date_col, "range": "trailing", "offset": offset,
+                    "semiadditive": "last"}
 
         return None
+
+    @classmethod
+    def _find_date_column(cls, dax_expr: str, func: str) -> str:
+        """Best-effort extraction of the date column referenced by *func*.
+
+        The date column is the final argument of TOTAL*TD(measure, dates), so we
+        parse the balanced argument list and take the last Table[Column] ref.
+        """
+        m = re.search(rf'\b{func}\s*\(', dax_expr, re.IGNORECASE)
+        search_space = dax_expr
+        if m:
+            open_idx = m.end() - 1
+            close_idx = cls._find_balanced_paren(dax_expr, open_idx)
+            if close_idx != -1:
+                inner = dax_expr[open_idx + 1:close_idx]
+                args = cls._split_top_level_args(inner)
+                # Prefer the last argument (the date reference).
+                search_space = args[-1] if args else inner
+        col_m = list(RE_TABLE_COL.finditer(search_space))
+        if col_m:
+            return col_m[-1].group(2).lower().replace(" ", "_")
+        return "date"
 
     @staticmethod
     def _find_balanced_paren(text: str, start: int) -> int:
@@ -401,9 +476,27 @@ class DAXTranslator:
             inner = sql[open_idx + 1:close_idx]  # everything inside CALCULATE(...)
             args = self._split_top_level_args(inner)
 
+            # Single-argument CALCULATE(expr) applies no filter — unwrap to expr.
+            if len(args) == 1:
+                self._transformations.append("CALCULATE_unwrap_single_arg")
+                result_parts.append(args[0])
+                pos = close_idx + 1
+                continue
+
             if len(args) >= 2:
                 measure_expr = args[0]
                 filter_expr = args[1]
+
+                # Time-intelligence filter: CALCULATE(m, DATESYTD(...) |
+                # SAMEPERIODLASTYEAR(...) | ...). The period logic is carried by
+                # the window spec (extracted from the original DAX), so drop the
+                # filter argument(s) and keep only the base measure expression.
+                rest = " ".join(args[1:])
+                if self._is_time_intel(rest):
+                    self._transformations.append("CALCULATE_time_intel_to_window")
+                    result_parts.append(measure_expr)
+                    pos = close_idx + 1
+                    continue
 
                 # Handle FILTER(ALL(table), condition)
                 filter_all = re.match(
@@ -412,18 +505,18 @@ class DAXTranslator:
                 )
                 if filter_all:
                     condition = filter_all.group(1).strip()
-                    condition = self._translate_table_col_refs(condition, table_name)
-                    self._transformations.append("CALCULATE_FILTER_ALL_to_CASE_WHEN")
-                    result_parts.append(f"CASE WHEN {condition} THEN {measure_expr} END")
+                    condition = self._to_filter_condition(condition, table_name)
+                    self._transformations.append("CALCULATE_FILTER_ALL_to_FILTER_WHERE")
+                    result_parts.append(f"{measure_expr} FILTER (WHERE {condition})")
                     pos = close_idx + 1
                     continue
 
                 # Simple column filter: Table[Col] = value
                 col_filter = RE_TABLE_COL.search(filter_expr)
                 if col_filter and '=' in filter_expr:
-                    condition = self._translate_table_col_refs(filter_expr, table_name)
-                    self._transformations.append("CALCULATE_simple_filter_to_CASE_WHEN")
-                    result_parts.append(f"CASE WHEN {condition} THEN {measure_expr} END")
+                    condition = self._to_filter_condition(filter_expr, table_name)
+                    self._transformations.append("CALCULATE_simple_filter_to_FILTER_WHERE")
+                    result_parts.append(f"{measure_expr} FILTER (WHERE {condition})")
                     pos = close_idx + 1
                     continue
 
@@ -437,8 +530,31 @@ class DAXTranslator:
 
         return ''.join(result_parts)
 
+    def _is_time_intel(self, expr: str) -> bool:
+        """True if *expr* contains a DAX time-intelligence function."""
+        funcs = (list(self._TI_CUMULATIVE) + list(self._TI_PRIOR_YEAR) +
+                 ["DATEADD", "DATESINPERIOD"])
+        return any(re.search(rf'\b{f}\b', expr, re.IGNORECASE) for f in funcs)
+
     def _pass_aggregations(self, sql: str, table_name: str) -> str:
         """Translate DAX aggregation functions to SQL equivalents."""
+        # Bare-column aggregates: SUM([Col]) etc., where [Col] is a fact column
+        # (not a measure). Handle before measure-ref resolution so they don't
+        # wrongly become SUM(MEASURE(`Col`)). Quoted/unqualified column only.
+        bare = {"SUM": "SUM", "COUNT": "COUNT", "AVERAGE": "AVG",
+                "MIN": "MIN", "MAX": "MAX", "COUNTA": "COUNT"}
+        for dax_fn, sql_fn in bare.items():
+            sql = re.sub(
+                rf'\b{dax_fn}\s*\(\s*\[(\w[\w\s]*?)\]\s*\)',
+                lambda m, f=sql_fn: f"{f}(source.{m.group(1).lower().replace(' ', '_')})",
+                sql, flags=re.IGNORECASE,
+            )
+        sql = re.sub(
+            r'\bDISTINCTCOUNT\s*\(\s*\[(\w[\w\s]*?)\]\s*\)',
+            lambda m: f"COUNT(DISTINCT source.{m.group(1).lower().replace(' ', '_')})",
+            sql, flags=re.IGNORECASE,
+        )
+
         # SUM(Table[Col])
         sql = re.sub(
             r'\bSUM\s*\(\s*\'?(\w[\w\s]*?)\'?\[(\w[\w\s]*?)\]\s*\)',
@@ -512,45 +628,32 @@ class DAXTranslator:
             sql, flags=re.IGNORECASE
         )
 
+        # Any remaining DISTINCTCOUNT(x) -> COUNT(DISTINCT x); VALUE(x) -> double(x).
+        # Token swaps that preserve the existing parentheses.
+        if re.search(r'\bDISTINCTCOUNT\s*\(', sql, re.IGNORECASE):
+            sql = re.sub(r'\bDISTINCTCOUNT\s*\(', 'COUNT(DISTINCT ', sql, flags=re.IGNORECASE)
+            self._transformations.append("DISTINCTCOUNT_to_COUNT_DISTINCT")
+        if re.search(r'\bVALUE\s*\(', sql, re.IGNORECASE):
+            sql = re.sub(r'\bVALUE\s*\(', 'double(', sql, flags=re.IGNORECASE)
+            self._transformations.append("VALUE_to_double_cast")
+
         return sql
 
     def _pass_conditional(self, sql: str) -> str:
         """Translate conditional logic functions."""
-        # DIVIDE(a, b, alt)
-        divide_pattern = re.compile(
-            r'\bDIVIDE\s*\(\s*(.+?)\s*,\s*(.+?)\s*,\s*(.+?)\s*\)',
-            re.IGNORECASE
-        )
-        if divide_pattern.search(sql):
-            sql = divide_pattern.sub(
-                lambda m: f"COALESCE(({m.group(1).strip()}) / NULLIF({m.group(2).strip()}, 0), {m.group(3).strip()})",
-                sql
-            )
-            self._transformations.append("DIVIDE_to_COALESCE_NULLIF")
+        # DIVIDE(num, den [, alt]) -> COALESCE(num / NULLIF(den, 0), alt).
+        # Balanced-paren parsing so nested MEASURE()/calls and their commas map
+        # to the correct arguments (a non-greedy regex mis-splits them).
+        sql = self._translate_divide(sql)
 
-        # DIVIDE(a, b) without alt
-        divide2_pattern = re.compile(
-            r'\bDIVIDE\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)',
-            re.IGNORECASE
-        )
-        if divide2_pattern.search(sql):
-            sql = divide2_pattern.sub(
-                lambda m: f"COALESCE(({m.group(1).strip()}) / NULLIF({m.group(2).strip()}, 0), 0)",
-                sql
-            )
-            self._transformations.append("DIVIDE_2arg_to_COALESCE_NULLIF")
+        # BLANK() -> NULL (DAX blank is SQL NULL)
+        sql = re.sub(r'\bBLANK\s*\(\s*\)', 'NULL', sql, flags=re.IGNORECASE)
 
-        # IF(cond, true, false)
-        if_pattern = re.compile(
-            r'\bIF\s*\(\s*(.+?)\s*,\s*(.+?)\s*,\s*(.+?)\s*\)',
-            re.IGNORECASE
-        )
-        if if_pattern.search(sql):
-            sql = if_pattern.sub(
-                lambda m: f"CASE WHEN {m.group(1).strip()} THEN {m.group(2).strip()} ELSE {m.group(3).strip()} END",
-                sql
-            )
-            self._transformations.append("IF_to_CASE_WHEN")
+        # IF(cond, true, false) -> CASE WHEN ... THEN ... ELSE ... END
+        # Uses balanced-parenthesis parsing (not a non-greedy regex) so nested
+        # calls and commas inside arguments — IF(a=0, BLANK(), SUM(T[c])) — pick
+        # the correct closing paren and never misplace the emitted END.
+        sql = self._translate_if(sql)
 
         # SWITCH(TRUE(), cond1, result1, cond2, result2, ..., default)
         switch_true = re.compile(
@@ -602,15 +705,70 @@ class DAXTranslator:
         if 'IS NULL' in sql and 'ISBLANK' not in sql:
             self._transformations.append("ISBLANK_to_IS_NULL")
 
-        # IFERROR(expr, alt) -> COALESCE(TRY(expr), alt)
-        sql = re.sub(
-            r'\bIFERROR\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)',
-            lambda m: f"COALESCE(TRY({m.group(1).strip()}), {m.group(2).strip()})",
-            sql, flags=re.IGNORECASE
-        )
-        if 'TRY(' in sql:
-            self._transformations.append("IFERROR_to_TRY")
+        # IFERROR(expr, alt) -> COALESCE(expr, alt). Databricks SQL has no bare
+        # TRY() scalar; COALESCE covers the common null-guard intent.
+        if re.search(r'\bIFERROR\s*\(', sql, re.IGNORECASE):
+            sql = re.sub(
+                r'\bIFERROR\s*\(\s*(.+?)\s*,\s*(.+?)\s*\)',
+                lambda m: f"COALESCE({m.group(1).strip()}, {m.group(2).strip()})",
+                sql, flags=re.IGNORECASE
+            )
+            self._transformations.append("IFERROR_to_COALESCE")
 
+        return sql
+
+    def _translate_divide(self, sql: str) -> str:
+        """Translate DAX DIVIDE(num, den[, alt]) via balanced-paren parsing."""
+        div_re = re.compile(r'\bDIVIDE\s*\(', re.IGNORECASE)
+        guard = 0
+        while guard < 500:
+            guard += 1
+            m = div_re.search(sql)
+            if not m:
+                break
+            open_idx = m.end() - 1
+            close_idx = self._find_balanced_paren(sql, open_idx)
+            if close_idx == -1:
+                break
+            args = self._split_top_level_args(sql[open_idx + 1:close_idx])
+            if len(args) < 2:
+                break
+            num, den = args[0].strip(), args[1].strip()
+            alt = args[2].strip() if len(args) >= 3 else "0"
+            replacement = f"COALESCE(({num}) / NULLIF({den}, 0), {alt})"
+            sql = sql[:m.start()] + replacement + sql[close_idx + 1:]
+            self._transformations.append("DIVIDE_to_COALESCE_NULLIF")
+        return sql
+
+    def _translate_if(self, sql: str) -> str:
+        """Translate DAX ``IF(cond, t, f)`` to ``CASE WHEN cond THEN t ELSE f END``.
+
+        Scans for ``IF(`` (word-boundary guarded so ``IFERROR`` is untouched),
+        extracts three top-level arguments via balanced-paren parsing, and
+        rewrites in place. Re-scans until no ``IF(`` remains so nested IFs in the
+        then/else branches are converted too.
+        """
+        if_re = re.compile(r'\bIF\s*\(', re.IGNORECASE)
+        guard = 0
+        while guard < 500:
+            guard += 1
+            m = if_re.search(sql)
+            if not m:
+                break
+            open_idx = m.end() - 1
+            close_idx = self._find_balanced_paren(sql, open_idx)
+            if close_idx == -1:
+                break
+            args = self._split_top_level_args(sql[open_idx + 1:close_idx])
+            if len(args) < 2:
+                # Malformed / untranslatable IF - leave the expression as-is.
+                break
+            cond = args[0].strip()
+            tval = args[1].strip()
+            fval = args[2].strip() if len(args) >= 3 else "NULL"
+            replacement = f"CASE WHEN {cond} THEN {tval} ELSE {fval} END"
+            sql = sql[:m.start()] + replacement + sql[close_idx + 1:]
+            self._transformations.append("IF_to_CASE_WHEN")
         return sql
 
     def _pass_logical(self, sql: str) -> str:
@@ -819,7 +977,19 @@ class DAXTranslator:
     def _translate_table_col_refs(self, sql: str, table_name: str) -> str:
         """Replace Table[Column] patterns with source.col or join.col."""
         def replace_ref(match):
-            tbl = match.group(1).strip("'").lower().replace(" ", "_")
+            raw = match.group(0)
+            tbl_raw = match.group(1)
+            # DAX unquoted table names cannot contain spaces; a captured table
+            # token with a space that is NOT quoted means the regex greedily
+            # swallowed preceding SQL keywords (e.g. "CASE WHEN [Measure]"). In
+            # that case this is a bare [ref], not a Table[Column] — leave it
+            # intact for the measure-ref pass to resolve.
+            if not raw.lstrip().startswith("'"):
+                stripped = tbl_raw.strip()
+                last_word = stripped.split()[-1] if stripped.split() else stripped
+                if " " in stripped or last_word.upper() in _SQL_KEYWORDS:
+                    return raw
+            tbl = tbl_raw.strip("'").lower().replace(" ", "_")
             col = match.group(2).lower().replace(" ", "_")
             fact_lower = table_name.lower().replace(" ", "_") if table_name else ""
 
@@ -839,6 +1009,17 @@ class DAXTranslator:
         if result != sql:
             self._transformations.append("table_column_refs")
         return result
+
+    def _to_filter_condition(self, condition: str, table_name: str) -> str:
+        """Prepare a DAX filter predicate for a SQL FILTER (WHERE ...) clause.
+
+        Translates Table[Column] references to source/join columns and converts
+        DAX double-quoted string literals to SQL single-quoted literals.
+        """
+        condition = self._translate_table_col_refs(condition.strip(), table_name)
+        # DAX uses double quotes for string literals; SQL uses single quotes.
+        condition = re.sub(r'"([^"]*)"', r"'\1'", condition)
+        return condition
 
     def _pass_measure_refs(self, sql: str) -> str:
         """Translate [Measure Name] references to MEASURE(`slug`)."""
