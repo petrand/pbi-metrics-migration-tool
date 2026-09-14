@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from backend import migration_store
 from backend.dax_translator import DAXTranslator
 from backend.dbx_client import DatabricksClient, DatabricksAuthError, DatabricksAPIError
 from backend.evaluator import EvaluationReporter
@@ -57,127 +58,6 @@ _state = {
     "migrations": {},
 }
 
-# ── Sample models for demo mode ──
-SAMPLE_MODELS = [
-    {
-        "id": "sales", "name": "Sales Analytics",
-        "tables": [
-            {"name": "FactSales", "columns": [
-                {"name": "SalesKey", "dataType": "int64"},
-                {"name": "OrderDate", "dataType": "dateTime"},
-                {"name": "ProductKey", "dataType": "int64"},
-                {"name": "CustomerKey", "dataType": "int64"},
-                {"name": "SalesAmount", "dataType": "decimal", "description": "Transaction amount"},
-                {"name": "Quantity", "dataType": "int64"},
-                {"name": "DiscountAmount", "dataType": "decimal"},
-            ], "measures": [
-                {"name": "Total Revenue", "expression": "SUM(FactSales[SalesAmount])", "description": "Sum of all sales amounts"},
-                {"name": "Total Quantity", "expression": "SUM(FactSales[Quantity])", "description": "Total units sold"},
-                {"name": "Avg Order Value", "expression": "DIVIDE(SUM(FactSales[SalesAmount]), DISTINCTCOUNT(FactSales[SalesKey]), 0)", "description": "Average revenue per order"},
-                {"name": "Customer Count", "expression": "DISTINCTCOUNT(FactSales[CustomerKey])", "description": "Unique customers"},
-                {"name": "Revenue per Customer", "expression": "DIVIDE(SUM(FactSales[SalesAmount]), DISTINCTCOUNT(FactSales[CustomerKey]), 0)", "description": "Revenue per unique customer"},
-                {"name": "Net Revenue", "expression": "SUM(FactSales[SalesAmount]) - SUM(FactSales[DiscountAmount])", "description": "Revenue after discounts"},
-            ]},
-            {"name": "DimProduct", "columns": [
-                {"name": "ProductKey", "dataType": "int64"},
-                {"name": "ProductName", "dataType": "string"},
-                {"name": "Category", "dataType": "string"},
-                {"name": "SubCategory", "dataType": "string"},
-            ]},
-            {"name": "DimCustomer", "columns": [
-                {"name": "CustomerKey", "dataType": "int64"},
-                {"name": "CustomerName", "dataType": "string"},
-                {"name": "Region", "dataType": "string"},
-                {"name": "Segment", "dataType": "string"},
-            ]},
-            {"name": "DimDate", "columns": [
-                {"name": "DateKey", "dataType": "int64"},
-                {"name": "Date", "dataType": "dateTime"},
-                {"name": "Year", "dataType": "int64"},
-                {"name": "Quarter", "dataType": "string"},
-                {"name": "Month", "dataType": "string"},
-            ]},
-        ],
-        "relationships": [
-            {"from": "FactSales.ProductKey", "to": "DimProduct.ProductKey", "type": "manyToOne"},
-            {"from": "FactSales.CustomerKey", "to": "DimCustomer.CustomerKey", "type": "manyToOne"},
-            {"from": "FactSales.OrderDate", "to": "DimDate.Date", "type": "manyToOne"},
-        ],
-    },
-    {
-        "id": "healthcare", "name": "Healthcare KPIs",
-        "tables": [
-            {"name": "FactClaims", "columns": [
-                {"name": "ClaimKey", "dataType": "int64"},
-                {"name": "PatientKey", "dataType": "int64"},
-                {"name": "ProviderKey", "dataType": "int64"},
-                {"name": "ServiceDate", "dataType": "dateTime"},
-                {"name": "ClaimAmount", "dataType": "decimal"},
-                {"name": "LengthOfStay", "dataType": "int64"},
-                {"name": "IsReadmission", "dataType": "boolean"},
-            ], "measures": [
-                {"name": "Total Claims", "expression": "SUM(FactClaims[ClaimAmount])", "description": "Total claim dollars"},
-                {"name": "Claim Count", "expression": "COUNT(FactClaims[ClaimKey])", "description": "Number of claims"},
-                {"name": "Avg Length of Stay", "expression": "AVERAGE(FactClaims[LengthOfStay])", "description": "Average patient stay"},
-                {"name": "Readmission Rate", "expression": "DIVIDE(SUM(FactClaims[IsReadmission]), COUNT(FactClaims[ClaimKey]), 0)", "description": "Readmission percentage"},
-                {"name": "Cost per Encounter", "expression": "DIVIDE(SUM(FactClaims[ClaimAmount]), COUNT(FactClaims[ClaimKey]), 0)", "description": "Average cost per claim"},
-            ]},
-            {"name": "DimPatient", "columns": [
-                {"name": "PatientKey", "dataType": "int64"},
-                {"name": "PatientName", "dataType": "string"},
-                {"name": "AgeGroup", "dataType": "string"},
-                {"name": "Gender", "dataType": "string"},
-            ]},
-            {"name": "DimProvider", "columns": [
-                {"name": "ProviderKey", "dataType": "int64"},
-                {"name": "ProviderName", "dataType": "string"},
-                {"name": "Specialty", "dataType": "string"},
-                {"name": "Facility", "dataType": "string"},
-            ]},
-        ],
-        "relationships": [
-            {"from": "FactClaims.PatientKey", "to": "DimPatient.PatientKey", "type": "manyToOne"},
-            {"from": "FactClaims.ProviderKey", "to": "DimProvider.ProviderKey", "type": "manyToOne"},
-        ],
-    },
-    {
-        "id": "finance", "name": "Financial Reporting",
-        "tables": [
-            {"name": "FactTransactions", "columns": [
-                {"name": "TransactionKey", "dataType": "int64"},
-                {"name": "AccountKey", "dataType": "int64"},
-                {"name": "PeriodKey", "dataType": "int64"},
-                {"name": "Amount", "dataType": "decimal"},
-                {"name": "BudgetAmount", "dataType": "decimal"},
-                {"name": "TransactionType", "dataType": "string"},
-            ], "measures": [
-                {"name": "Net Revenue", "expression": "SUM(FactTransactions[Amount])", "description": "Total net revenue"},
-                {"name": "Budget Total", "expression": "SUM(FactTransactions[BudgetAmount])", "description": "Total budget"},
-                {"name": "Budget Variance", "expression": "SUM(FactTransactions[Amount]) - SUM(FactTransactions[BudgetAmount])", "description": "Actual vs budget"},
-                {"name": "Transaction Count", "expression": "COUNT(FactTransactions[TransactionKey])", "description": "Number of transactions"},
-                {"name": "Avg Transaction", "expression": "AVERAGE(FactTransactions[Amount])", "description": "Average transaction value"},
-            ]},
-            {"name": "DimAccount", "columns": [
-                {"name": "AccountKey", "dataType": "int64"},
-                {"name": "AccountName", "dataType": "string"},
-                {"name": "AccountType", "dataType": "string"},
-                {"name": "Department", "dataType": "string"},
-            ]},
-            {"name": "DimPeriod", "columns": [
-                {"name": "PeriodKey", "dataType": "int64"},
-                {"name": "FiscalYear", "dataType": "int64"},
-                {"name": "FiscalQuarter", "dataType": "string"},
-                {"name": "FiscalMonth", "dataType": "string"},
-            ]},
-        ],
-        "relationships": [
-            {"from": "FactTransactions.AccountKey", "to": "DimAccount.AccountKey", "type": "manyToOne"},
-            {"from": "FactTransactions.PeriodKey", "to": "DimPeriod.PeriodKey", "type": "manyToOne"},
-        ],
-    },
-]
-
-
 # ══════════════════════════════════════════════════════════════════
 # Health & Info
 # ══════════════════════════════════════════════════════════════════
@@ -195,7 +75,6 @@ def ready():
             "capabilities": {
                 "pbi_api": PowerBIClient is not None,
                 "tmdl_upload": True,
-                "sample_models": True,
                 "dax_translation": True,
                 "yaml_validation": True,
                 "databricks_deploy": True,
@@ -298,28 +177,6 @@ async def tmdl_upload(file: UploadFile = File(...)):
                 "measures": sum(len(t.get("measures", [])) for t in model_dict.get("tables", []))}
     except Exception as e:
         raise HTTPException(500, f"TMDL parse error: {e}")
-
-
-# ══════════════════════════════════════════════════════════════════
-# Sample Models
-# ══════════════════════════════════════════════════════════════════
-
-@app.get("/api/samples")
-def list_samples():
-    return {"models": [{"id": m["id"], "name": m["name"],
-                        "tables": len(m["tables"]),
-                        "measures": sum(len(t.get("measures", [])) for t in m["tables"]),
-                        "relationships": len(m.get("relationships", []))}
-                       for m in SAMPLE_MODELS]}
-
-
-@app.get("/api/samples/{model_id}")
-def get_sample(model_id: str):
-    model = next((m for m in SAMPLE_MODELS if m["id"] == model_id), None)
-    if not model:
-        raise HTTPException(404, f"Sample model '{model_id}' not found")
-    _state["current_model"] = model
-    return {"model": model}
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -460,7 +317,7 @@ def run_migration(body: dict = {}):
     """Run the full migration pipeline."""
     model = body.get("model") or _state.get("current_model")
     if not model:
-        raise HTTPException(400, "No model loaded. Upload TMDL, extract from PBI, or select a sample.")
+        raise HTTPException(400, "No model loaded. Upload a TMDL export or extract from Power BI first.")
 
     config = MigrationConfig(
         catalog=body.get("catalog", "main"),
@@ -483,24 +340,66 @@ def run_migration(body: dict = {}):
     result = pipeline.run(model, config, dbx_client)
 
     _state["migrations"][result.migration_id] = result
+
+    # Persist the run (source model + result) so it can be reopened later —
+    # survives page reload and server restart. Never let a persistence error
+    # fail the request; the run already succeeded in memory.
+    record = result.to_dict()
+    record["created_at"] = result.started_at or datetime.now(timezone.utc).isoformat()
+    record["catalog"] = config.catalog
+    record["schema"] = config.schema
+    record["tables"] = len(model.get("tables", []))
+    record["measures"] = sum(len(t.get("measures", [])) for t in model.get("tables", []))
+    record["source_model"] = model
+    migration_store.save(result.migration_id, record)
+
     return result.to_dict()
 
 
 @app.get("/api/migrate/{migration_id}/status")
 def migration_status(migration_id: str):
     result = _state["migrations"].get(migration_id)
-    if not result:
-        raise HTTPException(404, "Migration not found")
-    return {"migration_id": migration_id, "status": result.status,
-            "progress": 100 if result.status in ("complete", "failed") else 50}
+    if result:
+        status = result.status
+    else:
+        record = migration_store.get(migration_id)
+        if not record:
+            raise HTTPException(404, "Migration not found")
+        status = record.get("status", "")
+    return {"migration_id": migration_id, "status": status,
+            "progress": 100 if status in ("complete", "failed") else 50}
 
 
 @app.get("/api/migrate/{migration_id}/report")
 def migration_report(migration_id: str):
     result = _state["migrations"].get(migration_id)
-    if not result:
+    if result:
+        return result.to_dict()
+    # Fall back to the persisted record (e.g. after a server restart).
+    record = migration_store.get(migration_id)
+    if not record:
         raise HTTPException(404, "Migration not found")
-    return result.to_dict()
+    return record
+
+
+# ══════════════════════════════════════════════════════════════════
+# Migration History (persisted upload + migration results)
+# ══════════════════════════════════════════════════════════════════
+
+@app.get("/api/migrations")
+def list_migrations():
+    """List past migrations (persisted), newest first, for reopening later."""
+    return {"migrations": migration_store.list_summaries()}
+
+
+@app.get("/api/migrations/{migration_id}")
+def get_migration(migration_id: str):
+    """Return a full persisted migration record — the source model plus the
+    migration result — so a previous upload and its results can be reopened."""
+    record = migration_store.get(migration_id)
+    if not record:
+        raise HTTPException(404, "Migration not found")
+    return record
 
 
 # ── Dashboard Endpoints ──────────────────────────────────────────────

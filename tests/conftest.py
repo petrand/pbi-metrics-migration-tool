@@ -1,7 +1,19 @@
 """
 Shared pytest fixtures for pbi-metrics-migration-tool tests.
 """
+import os
+import tempfile
+
 import pytest
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolated_migration_store():
+    """Persist migration records to a throwaway dir so tests don't pollute the
+    repo's data/ directory."""
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["MIGRATION_STORE_DIR"] = d
+        yield
 
 
 @pytest.fixture

@@ -56,6 +56,26 @@ const STATUS_COLOR = {
   partial: '#fbbf24', unsupported: '#f87171', excluded: '#94a3b8',
 };
 
+// Classify WHY a measure was excluded from the deployed view, into a
+// human-readable bucket. Uses the backend's exclusion_reason first, then falls
+// back to inspecting the original DAX (e.g. residual-DAX exclusions).
+const _TIME_INTEL = /\b(TOTALYTD|TOTALQTD|TOTALMTD|DATESYTD|DATESQTD|DATESMTD|SAMEPERIODLASTYEAR|PREVIOUSYEAR|PREVIOUSMONTH|PREVIOUSQUARTER|PREVIOUSDAY|NEXTYEAR|NEXTMONTH|NEXTQUARTER|PARALLELPERIOD|DATEADD|DATESINPERIOD|DATESBETWEEN|ENDOFMONTH|ENDOFQUARTER|ENDOFYEAR|STARTOFMONTH|STARTOFQUARTER|STARTOFYEAR|OPENINGBALANCE\w*|CLOSINGBALANCE\w*|FIRSTDATE|LASTDATE|FIRSTNONBLANK|LASTNONBLANK)\b/i;
+const _FILTER_CTX = /\b(CALCULATE|CALCULATETABLE|FILTER|ALLEXCEPT|ALLSELECTED|ALLCROSSFILTERED|ALLNOBLANKROW|ALL|VALUES|ADDCOLUMNS|SELECTCOLUMNS|SUMMARIZE\w*|GROUPBY|EARLIER|EARLIEST|RELATEDTABLE|USERELATIONSHIP|CROSSFILTER|RANKX|TOPN|GENERATE\w*)\b/i;
+
+function classifyExclusion(m) {
+  const reason = (m.exclusion_reason || '').toLowerCase();
+  const dax = m.original_dax || '';
+  if (reason.includes('non-aggregating')) return 'Non-aggregating';
+  if (reason.includes('window-over-window')) return 'Time intelligence';
+  if (reason.includes('references a measure')) return 'Depends on excluded measure';
+  if (reason.includes('excluded upstream')) return 'Excluded upstream';
+  // Residual-DAX (or unknown) — inspect the original expression.
+  if (_TIME_INTEL.test(dax)) return 'Time intelligence';
+  if (_FILTER_CTX.test(dax)) return 'Filter/context DAX';
+  if (dax.includes('[')) return 'Unresolved reference';
+  return 'No SQL analog';
+}
+
 function ConfidenceBar({ value }) {
   const v = Math.max(0, Math.min(100, value ?? 0));
   const c = v >= 70 ? '#4ade80' : v >= 40 ? '#fbbf24' : '#f87171';
@@ -115,6 +135,9 @@ function MeasureDetail({ m }) {
 function ResultsExplorer({ groups, totals }) {
   const [openGroup, setOpenGroup] = useState(null);
   const [openMeasure, setOpenMeasure] = useState(null);
+  const [openIssues, setOpenIssues] = useState(null);
+  const [measureTab, setMeasureTab] = useState('converted');
+  const [excludedCat, setExcludedCat] = useState('all');
   const sorted = [...(groups || [])].sort((a, b) => (b.total_measures || 0) - (a.total_measures || 0));
   const totalMeasures = sorted.reduce((s, g) => s + (g.total_measures || 0), 0);
 
@@ -134,8 +157,8 @@ function ResultsExplorer({ groups, totals }) {
       <div style={{ display: 'flex', gap: 10 }}>
         {chip('Fact tables / views', sorted.length, '#a5b4fc')}
         {chip('Measures', totalMeasures, '#6366f1')}
-        {chip('Converted', totals?.converted ?? '—', '#4ade80')}
-        {chip('Partial', totals?.partial ?? '—', '#fbbf24')}
+        {chip('In view', totals?.deployed ?? '—', '#4ade80')}
+        {chip('Not in view', totals?.not_deployed ?? '—', '#94a3b8')}
         {chip('Conversion', totals?.overall_conversion_rate != null ? `${totals.overall_conversion_rate}%` : '—', '#a78bfa')}
       </div>
 
@@ -145,8 +168,30 @@ function ResultsExplorer({ groups, totals }) {
         const isOpen = openGroup === g.name;
         const rate = g.conversion_rate ?? 0;
         const vClass = g.validation_status === 'OK' ? 'tag-success' : g.validation_status === 'WARNINGS' ? 'tag-warning' : 'tag-error';
-        const notInView = (g.measures || []).filter(x => x.deployed === false).length;
+        // Excluded is a deployment axis (matches the "not in view" badge);
+        // conversion quality is a status axis (matches the partial/converted
+        // badges). They overlap on purpose — a partial measure that was also
+        // excluded from the view shows in both its status tab and Excluded.
+        const excludedMeasures = (g.measures || []).filter(x => x.deployed === false);
+        const convertedMeasures = (g.measures || []).filter(m => m.deployed !== false && (m.status === 'converted' || m.status === 'manual_override'));
+        const partialMeasures = (g.measures || []).filter(m => m.status === 'partial');
+        const failedMeasures = (g.measures || []).filter(m => !['converted', 'manual_override', 'partial', 'excluded'].includes(m.status));
+        const notInView = excludedMeasures.length;
         const inView = (g.total_measures || 0) - notInView;
+        // Aggregate the group's logs so they can be seen in one click, rather
+        // than expanding every measure: hard errors, warnings, and the reasons
+        // measures were excluded from the deployed view ("not in view").
+        const errLogs = (g.measures || []).flatMap(m => (m.issues || []).map(t => ({ measure: m.name, text: t })));
+        const warnLogs = (g.measures || []).flatMap(m =>
+          (m.warnings || [])
+            // The "Excluded from deployed view" warning is already shown, with
+            // its reason, in the excluded section below — don't repeat it here.
+            .filter(t => !String(t).startsWith('Excluded from deployed view'))
+            .map(t => ({ measure: m.name, text: t }))
+        );
+        const issuesOpen = openIssues === g.name;
+        const logCount = errLogs.length + warnLogs.length + notInView;
+        const toggleIssues = (e) => { e.stopPropagation(); setOpenIssues(issuesOpen ? null : g.name); };
         return (
           <div key={g.name} className="glass" style={{ overflow: 'hidden' }}>
             <div onClick={() => { setOpenGroup(isOpen ? null : g.name); setOpenMeasure(null); }}
@@ -158,57 +203,135 @@ function ResultsExplorer({ groups, totals }) {
               </div>
               <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
                 <span className="tag tag-success" style={{ fontSize: 10 }}>{inView} in view</span>
-                {notInView > 0 && <span className="tag" style={{ fontSize: 10, background: 'rgba(148,163,184,0.15)', color: '#94a3b8' }}>⊘ {notInView} not in view</span>}
+                {notInView > 0 && <span className="tag" title="Click to see why these were excluded from the deployed view" onClick={toggleIssues} style={{ fontSize: 10, background: 'rgba(148,163,184,0.15)', color: '#94a3b8', cursor: 'pointer', textDecoration: issuesOpen ? 'underline' : 'none' }}>⊘ {notInView} not in view</span>}
                 {(g.dimensions || []).length > 0 && <span className="tag tag-info" style={{ fontSize: 10 }}>{g.dimensions.length} dims</span>}
                 {g.partial > 0 && <span className="tag tag-warning" style={{ fontSize: 10 }}>{g.partial} partial</span>}
                 {g.unsupported > 0 && <span className="tag tag-error" style={{ fontSize: 10 }}>{g.unsupported} unsupported</span>}
               </div>
               <div style={{ minWidth: 100 }}><ConfidenceBar value={rate} /></div>
-              <span className={`tag ${vClass}`} style={{ fontSize: 10, justifySelf: 'end' }}>{g.validation_status}</span>
+              <span className={`tag ${vClass}`} onClick={logCount ? toggleIssues : undefined}
+                title={logCount ? 'Click to see errors, warnings and excluded-measure reasons' : 'No issues'}
+                style={{ fontSize: 10, justifySelf: 'end', cursor: logCount ? 'pointer' : 'default', textDecoration: issuesOpen ? 'underline' : 'none' }}>
+                {g.validation_status}{logCount ? ` (${logCount})` : ''}
+              </span>
             </div>
 
-            {isOpen && (
-              <div style={{ borderTop: '1px solid rgba(255,255,255,0.08)' }}>
-                {(g.dimensions || []).length > 0 && (
-                  <div style={{ padding: '10px 14px 12px 34px', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
-                    <div style={{ fontSize: 10, textTransform: 'uppercase', color: '#64748b', marginBottom: 6 }}>Converted dimension columns ({g.dimensions.length})</div>
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(240px,1fr))', gap: '3px 16px' }}>
-                      {g.dimensions.map((d, di) => (
-                        <div key={di} style={{ fontSize: 11.5, display: 'flex', gap: 6, alignItems: 'baseline' }} title={`${d.name} = ${d.expr}`}>
-                          <span style={{ color: '#e2e8f0', fontWeight: 600 }}>{d.name}</span>
-                          <code style={{ color: '#7dd3fc', fontSize: 10.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>← {d.expr}</code>
-                        </div>
-                      ))}
-                    </div>
+            {issuesOpen && (
+              <div style={{ borderTop: '1px solid rgba(255,255,255,0.08)', background: 'rgba(0,0,0,0.18)', padding: '12px 16px 14px 34px' }}>
+                {errLogs.length > 0 && (
+                  <div style={{ marginBottom: warnLogs.length || notInView ? 12 : 0 }}>
+                    <div style={{ fontSize: 10, textTransform: 'uppercase', color: '#f87171', marginBottom: 6 }}>Errors ({errLogs.length})</div>
+                    {errLogs.map((l, i) => (
+                      <div key={`e${i}`} style={{ fontSize: 11.5, color: '#fca5a5', marginBottom: 3 }}>
+                        <span style={{ fontWeight: 700, color: '#e2e8f0' }}>{l.measure}</span> — {l.text}
+                      </div>
+                    ))}
                   </div>
                 )}
-                <div style={{ padding: '6px 14px 6px 34px', display: 'grid', gridTemplateColumns: 'minmax(160px,1.6fr) minmax(200px,2fr) 120px 100px', gap: 12, fontSize: 10, textTransform: 'uppercase', color: '#64748b', position: 'sticky', top: 0, background: '#202039' }}>
-                  <span>Measure</span><span>Translated SQL</span><span>Confidence</span><span>Status</span>
-                </div>
-                <div style={{ maxHeight: 420, overflowY: 'auto' }}>
-                  {(g.measures || []).map((m, i) => {
-                    const key = `${g.name}::${m.name}::${i}`;
-                    const mOpen = openMeasure === key;
-                    const color = STATUS_COLOR[m.status] || '#94a3b8';
-                    return (
-                      <div key={key}>
-                        <div onClick={() => setOpenMeasure(mOpen ? null : key)}
-                          style={{ padding: '9px 14px 9px 34px', cursor: 'pointer', display: 'grid', gridTemplateColumns: 'minmax(160px,1.6fr) minmax(200px,2fr) 120px 100px', gap: 12, alignItems: 'center', fontSize: 12, borderBottom: '1px solid rgba(255,255,255,0.04)', background: mOpen ? 'rgba(99,102,241,0.06)' : 'transparent' }}>
-                          <span style={{ fontWeight: 600, opacity: m.deployed === false ? 0.6 : 1 }}>
-                            {m.name}
-                            {m.deployed === false && <span title={m.exclusion_reason} style={{ marginLeft: 6, fontSize: 10, color: '#94a3b8' }}>⊘ not in view</span>}
-                          </span>
-                          <code title={m.translated_sql} style={{ color: '#4ade80', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.translated_sql || '—'}</code>
-                          <ConfidenceBar value={m.confidence} />
-                          <span className="tag" style={{ fontSize: 10, background: `${color}22`, color, justifySelf: 'start' }}>{m.status}</span>
-                        </div>
-                        {mOpen && <MeasureDetail m={m} />}
+                {warnLogs.length > 0 && (
+                  <div style={{ marginBottom: notInView ? 12 : 0 }}>
+                    <div style={{ fontSize: 10, textTransform: 'uppercase', color: '#fbbf24', marginBottom: 6 }}>Warnings ({warnLogs.length})</div>
+                    {warnLogs.map((l, i) => (
+                      <div key={`w${i}`} style={{ fontSize: 11.5, color: '#fcd34d', marginBottom: 3 }}>
+                        <span style={{ fontWeight: 700, color: '#e2e8f0' }}>{l.measure}</span> — {l.text}
                       </div>
-                    );
-                  })}
-                </div>
+                    ))}
+                  </div>
+                )}
+                {notInView > 0 && (
+                  <div>
+                    <div style={{ fontSize: 10, textTransform: 'uppercase', color: '#94a3b8', marginBottom: 6 }}>Excluded from the deployed view ({notInView})</div>
+                    {excludedMeasures.map((m, i) => (
+                      <div key={`x${i}`} style={{ fontSize: 11.5, color: '#cbd5e1', marginBottom: 3 }}>
+                        <span style={{ fontWeight: 700 }}>{m.name}</span> — <span style={{ color: '#94a3b8' }}>{m.exclusion_reason || 'not deployable'}</span>
+                      </div>
+                    ))}
+                    <div style={{ fontSize: 10.5, color: '#64748b', marginTop: 6 }}>These are candidates for a manual measure_override. Click a measure below for its full DAX → SQL detail.</div>
+                  </div>
+                )}
               </div>
             )}
+
+            {isOpen && (() => {
+              const tabs = [
+                ['converted', 'Successfully converted', convertedMeasures, '#4ade80'],
+                ['partial', 'Partial conversion', partialMeasures, '#fbbf24'],
+                ['failed', 'Failed conversion', failedMeasures, '#f87171'],
+                ['excluded', 'Excluded from view', excludedMeasures, '#94a3b8'],
+              ];
+              const active = tabs.find(t => t[0] === measureTab) || tabs[0];
+              let rows = active[2];
+              // For the Excluded tab, sub-classify by exclusion type and let the
+              // user filter by category (Time intelligence, No SQL analog, etc.).
+              let subFilter = null;
+              if (measureTab === 'excluded' && excludedMeasures.length > 0) {
+                const cats = {};
+                excludedMeasures.forEach(m => { const c = classifyExclusion(m); (cats[c] = cats[c] || []).push(m); });
+                const catNames = Object.keys(cats).sort((a, b) => cats[b].length - cats[a].length);
+                rows = excludedCat === 'all' ? excludedMeasures : (cats[excludedCat] || []);
+                const catChip = (label, count, activeCat) => (
+                  <span key={label} onClick={(e) => { e.stopPropagation(); setExcludedCat(label); setOpenMeasure(null); }}
+                    className="tag" style={{ cursor: 'pointer', fontSize: 10, background: activeCat ? 'rgba(99,102,241,0.3)' : 'rgba(255,255,255,0.06)', color: activeCat ? '#c7d2fe' : '#cbd5e1', border: activeCat ? '1px solid rgba(99,102,241,0.6)' : '1px solid transparent' }}>
+                    {label} {count}
+                  </span>
+                );
+                subFilter = (
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', padding: '8px 14px 8px 30px', borderBottom: '1px solid rgba(255,255,255,0.06)', alignItems: 'center' }}>
+                    <span style={{ fontSize: 10, textTransform: 'uppercase', color: '#64748b', marginRight: 4 }}>Reason</span>
+                    {catChip('all', excludedMeasures.length, excludedCat === 'all')}
+                    {catNames.map(c => catChip(c, cats[c].length, excludedCat === c))}
+                  </div>
+                );
+              }
+              return (
+                <div style={{ borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+                  <div style={{ display: 'flex', gap: 4, padding: '8px 14px 0 30px', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+                    {tabs.map(([id, label, list, color]) => (
+                      <div key={id} onClick={(e) => { e.stopPropagation(); setMeasureTab(id); setOpenMeasure(null); setExcludedCat('all'); }}
+                        className={`tab ${measureTab === id ? 'tab-active' : 'tab-inactive'}`} style={{ fontSize: 12 }}>
+                        {label} <span style={{ color, fontWeight: 700 }}>{list.length}</span>
+                      </div>
+                    ))}
+                  </div>
+                  {subFilter}
+                  <div style={{ padding: '6px 14px 6px 30px', display: 'grid', gridTemplateColumns: 'minmax(150px,1fr) minmax(180px,1.6fr) minmax(180px,1.6fr) 90px', gap: 12, fontSize: 10, textTransform: 'uppercase', color: '#64748b', position: 'sticky', top: 0, background: '#202039' }}>
+                    <span>Measure</span><span>Original DAX (Power BI)</span><span>Migrated SQL</span><span>Confidence</span>
+                  </div>
+                  <div style={{ maxHeight: 460, overflowY: 'auto' }}>
+                    {rows.length === 0 && (
+                      <div style={{ padding: '14px 30px', color: '#64748b', fontSize: 12 }}>No measures in this category.</div>
+                    )}
+                    {rows.map((m, i) => {
+                      const key = `${g.name}::${measureTab}::${m.name}::${i}`;
+                      const mOpen = openMeasure === key;
+                      const color = STATUS_COLOR[m.status] || '#94a3b8';
+                      const notInView = m.deployed === false;
+                      // Clamp long code to 2 lines but keep it visible for every
+                      // measure — errored / unconverted ones included.
+                      const codeClamp = { fontSize: 11, lineHeight: 1.4, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden', whiteSpace: 'pre-wrap', wordBreak: 'break-word' };
+                      return (
+                        <div key={key}>
+                          <div onClick={() => setOpenMeasure(mOpen ? null : key)}
+                            style={{ padding: '9px 14px 9px 30px', cursor: 'pointer', display: 'grid', gridTemplateColumns: 'minmax(150px,1fr) minmax(180px,1.6fr) minmax(180px,1.6fr) 90px', gap: 12, alignItems: 'start', fontSize: 12, borderBottom: '1px solid rgba(255,255,255,0.04)', borderLeft: `3px solid ${color}`, background: mOpen ? 'rgba(99,102,241,0.06)' : notInView ? 'rgba(148,163,184,0.05)' : 'transparent' }}>
+                            <div style={{ minWidth: 0 }}>
+                              <div style={{ fontWeight: 600, opacity: notInView ? 0.75 : 1, wordBreak: 'break-word' }}>{m.name}</div>
+                              <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 3, alignItems: 'center' }}>
+                                <span className="tag" style={{ fontSize: 9, background: `${color}22`, color }}>{m.status}</span>
+                                {notInView && <span title={m.exclusion_reason} className="tag" style={{ fontSize: 9, background: 'rgba(148,163,184,0.15)', color: '#cbd5e1' }}>⊘ {classifyExclusion(m)}</span>}
+                              </div>
+                            </div>
+                            <code title={m.original_dax} style={{ ...codeClamp, color: '#fbbf24' }}>{m.original_dax || '—'}</code>
+                            <code title={m.translated_sql} style={{ ...codeClamp, color: notInView ? '#94a3b8' : '#4ade80' }}>{m.translated_sql || (notInView ? '(excluded from view)' : '—')}</code>
+                            <ConfidenceBar value={m.confidence} />
+                          </div>
+                          {mOpen && <MeasureDetail m={m} />}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         );
       })}
@@ -217,11 +340,11 @@ function ResultsExplorer({ groups, totals }) {
 }
 
 export default function App() {
-  const [page, setPage] = useState('dashboard');
+  const [page, setPage] = useState('connect');
   const [connectTab, setConnectTab] = useState('pbi');
   const [selectedModel, setSelectedModel] = useState(null);
-  const [sampleModels, setSampleModels] = useState([]);
-  const [capabilities, setCapabilities] = useState(null);
+  const [history, setHistory] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [migrationState, setMigrationState] = useState('idle');
   const [migrationProgress, setMigrationProgress] = useState(0);
   const [migrationLog, setMigrationLog] = useState([]);
@@ -272,26 +395,16 @@ export default function App() {
     setDeployLog(prev => [...prev, { time: new Date().toLocaleTimeString(), msg, type }]);
   }, []);
 
-  // Load sample models + capabilities on mount
-  useEffect(() => {
-    apiFetch('/api/samples')
-      .then(async data => {
-        const summaries = data.models || data || [];
-        const models = await Promise.all(
-          summaries.map(async summary => {
-            try {
-              const detail = await apiFetch(`/api/samples/${summary.id}`);
-              return detail.model || detail;
-            } catch (_) {
-              return summary;
-            }
-          })
-        );
-        setSampleModels(models);
-      })
-      .catch(() => {});
-    apiFetch('/api/ready').then(data => setCapabilities(data.capabilities || null)).catch(() => {});
+  // Load persisted migration history (past uploads + migration results).
+  const loadHistory = useCallback(() => {
+    setHistoryLoading(true);
+    apiFetch('/api/migrations')
+      .then(data => setHistory(data.migrations || []))
+      .catch(() => {})
+      .finally(() => setHistoryLoading(false));
   }, []);
+
+  useEffect(() => { loadHistory(); }, [loadHistory]);
 
   // Poll migration status
   useEffect(() => {
@@ -403,10 +516,29 @@ export default function App() {
           : `Migration complete (ID: ${data.migration_id || data.id})`,
         uiState === 'error' ? 'error' : 'success'
       );
+      loadHistory();  // the run is now persisted — refresh the History list
     } catch (e) {
       addLog(`Error: ${e.message}`, 'error');
       setMigrationState('error');
     }
+  };
+
+  // Reopen a persisted migration (its uploaded model + results) from History.
+  const openMigration = async (id) => {
+    try {
+      const rec = await apiFetch(`/api/migrations/${id}`);
+      setSelectedModel(rec.source_model || null);
+      setMigrationId(rec.migration_id || id);
+      setMigrationReport(rec);
+      setGeneratedYAML(Object.values(rec.generated_yaml || {}).join('\n\n'));
+      setGeneratedSQL(Object.values(rec.generated_sql || {}).join('\n\n'));
+      setMigrationState(rec.status === 'failed' ? 'error' : 'complete');
+      setMigrationProgress(100);
+      setMigrationLog([]);
+      (rec.steps || []).forEach(s => addLog(`${s.name}: ${s.message}`, s.status === 'failed' ? 'error' : 'success'));
+      setActiveTab('results');
+      setPage('migrate');
+    } catch (_) { /* ignore — record may have been removed */ }
   };
 
   // Translate single DAX measure
@@ -450,23 +582,13 @@ export default function App() {
   };
 
   const navItems = [
-    { id: 'dashboard', icon: '◉', label: 'Dashboard' },
     { id: 'connect', icon: '⚡', label: 'Connect' },
     { id: 'explore', icon: '🔍', label: 'Explore' },
     { id: 'migrate', icon: '🔄', label: 'Migrate' },
     { id: 'deploy', icon: '🚀', label: 'Deploy' },
+    { id: 'history', icon: '🕘', label: 'History' },
   ];
 
-  // Compute dashboard stats from sampleModels
-  const totalMeasures = sampleModels.reduce((sum, m) => {
-    if (typeof m.measures === 'number') return sum + m.measures;
-    if (!Array.isArray(m.tables)) return sum;
-    return sum + m.tables.reduce((tableSum, t) => tableSum + (t.measures?.length || 0), 0);
-  }, 0);
-  const totalRelationships = sampleModels.reduce((sum, m) => {
-    if (typeof m.relationships === 'number') return sum + m.relationships;
-    return sum + (Array.isArray(m.relationships) ? m.relationships.length : 0);
-  }, 0);
   const pipelineSummary = migrationReport?.pipeline_summary || migrationReport;
   const factGroups = pipelineSummary?.fact_groups || [];
   const translationResults = factGroups.flatMap(group =>
@@ -519,7 +641,7 @@ export default function App() {
         </div>
         {navItems.map(n => (
           <motion.div key={n.id} className={`nav-item ${page === n.id ? 'nav-active' : ''}`}
-            onClick={() => setPage(n.id)} whileHover={{ x: 4 }} whileTap={{ scale: 0.97 }}>
+            onClick={() => { setPage(n.id); if (n.id === 'history') loadHistory(); }} whileHover={{ x: 4 }} whileTap={{ scale: 0.97 }}>
             <span style={{ fontSize: 16 }}>{n.icon}</span> {n.label}
           </motion.div>
         ))}
@@ -536,11 +658,11 @@ export default function App() {
       <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
         <div style={{ padding: '16px 24px', borderBottom: '1px solid rgba(255,255,255,0.06)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <h1 style={{ fontSize: 20, fontWeight: 600, margin: 0 }}>
-            {page === 'dashboard' && 'Migration Dashboard'}
             {page === 'connect' && 'Connect Services'}
             {page === 'explore' && 'Explore Semantic Models'}
             {page === 'migrate' && 'DAX → YAML Migration'}
             {page === 'deploy' && 'Deploy to Databricks'}
+            {page === 'history' && 'Migration History'}
           </h1>
           <div style={{ fontSize: 12, color: '#64748b' }}>Port 8000 • Serverless SQL Warehouse</div>
         </div>
@@ -548,81 +670,11 @@ export default function App() {
         <div className="scroll-area" style={{ flex: 1, padding: 24, overflowY: 'auto' }}>
           <AnimatePresence mode="wait">
 
-            {/* DASHBOARD */}
-            {page === 'dashboard' && (
-              <motion.div key="dashboard" variants={pageVariants} initial="initial" animate="animate" exit="exit" style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-                <motion.div variants={staggerContainer} initial="initial" animate="animate" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 16 }}>
-                  {[
-                    { label: 'Sample Models', value: String(sampleModels.length || '—'), color: '#6366f1' },
-                    { label: 'Total Measures', value: String(totalMeasures || '—'), color: '#8b5cf6' },
-                    { label: 'Relationships', value: String(totalRelationships || '—'), color: '#a78bfa' },
-                    { label: 'API Status', value: capabilities ? 'Ready' : '...', color: '#4ade80' },
-                  ].map((card, i) => (
-                    <motion.div key={i} className="glass" style={{ padding: 20 }} variants={cardVariants} custom={i} whileHover="hover">
-                      <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{card.label}</div>
-                      <div style={{ fontSize: 32, fontWeight: 700, color: card.color }}>{card.value}</div>
-                    </motion.div>
-                  ))}
-                </motion.div>
-
-                {capabilities && (
-                  <motion.div className="glass" style={{ padding: 20 }} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.15 }}>
-                    <h3 style={{ margin: '0 0 12px', fontSize: 15 }}>Backend Capabilities</h3>
-                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                      {Object.entries(capabilities).map(([k, v]) => (
-                        <span key={k} className={`tag ${v ? 'tag-success' : 'tag-warning'}`}>{v ? '✓' : '✗'} {k.replace(/_/g, ' ')}</span>
-                      ))}
-                    </div>
-                  </motion.div>
-                )}
-
-                <motion.div className="glass" style={{ padding: 20 }} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }}>
-                  <h3 style={{ margin: '0 0 16px', fontSize: 16 }}>Sample Semantic Models</h3>
-                  {sampleModels.length === 0 ? (
-                    <div style={{ color: '#64748b', fontSize: 13 }}>Loading models from API...</div>
-                  ) : (
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 16 }}>
-                      {sampleModels.map((m, i) => {
-                        const factTable = (m.tables || []).find(t => t.measures?.length > 0);
-                        return (
-                          <motion.div key={m.id || i} className="glass" style={{ padding: 16, cursor: 'pointer' }}
-                            variants={cardVariants} custom={i} initial="initial" animate="animate" whileHover="hover"
-                            onClick={() => { setSelectedModel(m); setPage('explore'); }}>
-                            <div style={{ fontWeight: 600, marginBottom: 8 }}>{m.name}</div>
-                            <div style={{ fontSize: 12, color: '#94a3b8', display: 'flex', flexDirection: 'column', gap: 4 }}>
-                              <span>{(m.tables || []).length} tables • {factTable?.measures?.length || 0} measures</span>
-                              <span>{(m.relationships || []).length} relationships</span>
-                            </div>
-                            <div style={{ marginTop: 12, display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                              {(factTable?.measures || []).slice(0, 3).map((ms, j) => (
-                                <span key={j} className="tag tag-info">{ms.name}</span>
-                              ))}
-                              {(factTable?.measures?.length || 0) > 3 && <span className="tag tag-info">+{factTable.measures.length - 3}</span>}
-                            </div>
-                          </motion.div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </motion.div>
-
-                <motion.div className="glass" style={{ padding: 20 }} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.4 }}>
-                  <h3 style={{ margin: '0 0 12px', fontSize: 16 }}>Architecture Flow</h3>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, padding: 16, flexWrap: 'wrap' }}>
-                    {['Power BI\nSemantic Model', '→', 'DAX\nExtraction', '→', 'DAX→SQL\nTranslation', '→', 'YAML v1.1\nGeneration', '→', 'Statement\nExecution API', '→', 'Unity Catalog\nMetric View'].map((s, i) => (
-                      <motion.div key={i} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: i * 0.07 }}
-                        style={{ textAlign: 'center', fontSize: s === '→' ? 20 : 11, color: s === '→' ? '#6366f1' : '#e2e8f0', padding: s === '→' ? '0 4px' : '12px 14px', background: s === '→' ? 'none' : 'rgba(99,102,241,0.1)', borderRadius: 8, whiteSpace: 'pre-line', fontWeight: s === '→' ? 400 : 500, lineHeight: 1.4, minWidth: s === '→' ? 'auto' : 90 }}>{s}</motion.div>
-                    ))}
-                  </div>
-                </motion.div>
-              </motion.div>
-            )}
-
             {/* CONNECT */}
             {page === 'connect' && (
               <motion.div key="connect" variants={pageVariants} initial="initial" animate="animate" exit="exit" style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
                 <div style={{ display: 'flex', gap: 4 }}>
-                  {[['pbi', '📊 Power BI OAuth2'], ['tmdl', '📁 TMDL Upload'], ['sample', '🗃 Sample Models']].map(([id, label]) => (
+                  {[['pbi', '📊 Power BI OAuth2'], ['tmdl', '📁 TMDL Upload']].map(([id, label]) => (
                     <div key={id} className={`tab ${connectTab === id ? 'tab-active' : 'tab-inactive'}`} onClick={() => setConnectTab(id)}>{label}</div>
                   ))}
                 </div>
@@ -685,22 +737,6 @@ export default function App() {
                     </motion.div>
                   )}
 
-                  {connectTab === 'sample' && (
-                    <motion.div key="sample" initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                      <div style={{ fontSize: 13, color: '#94a3b8' }}>Select a built-in sample model to explore and migrate:</div>
-                      {sampleModels.map((m, i) => (
-                        <motion.div key={m.id || i} className="glass" style={{ padding: 16, cursor: 'pointer', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
-                          variants={cardVariants} custom={i} initial="initial" animate="animate" whileHover="hover"
-                          onClick={() => { setSelectedModel(m); setPage('explore'); }}>
-                          <div>
-                            <div style={{ fontWeight: 600 }}>{m.name}</div>
-                            <div style={{ fontSize: 12, color: '#64748b', marginTop: 4 }}>{(m.tables || []).length} tables • {(m.relationships || []).length} relationships</div>
-                          </div>
-                          <button className="btn-secondary" style={{ fontSize: 12 }}>Select →</button>
-                        </motion.div>
-                      ))}
-                    </motion.div>
-                  )}
                 </AnimatePresence>
 
                 {/* DBX Auth below tabs */}
@@ -734,11 +770,10 @@ export default function App() {
               <motion.div key="explore" variants={pageVariants} initial="initial" animate="animate" exit="exit" style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
                 {!selectedModel ? (
                   <div className="glass" style={{ padding: 20 }}>
-                    <p style={{ color: '#94a3b8' }}>Select a model from Dashboard or Connect → Sample Models.</p>
+                    <p style={{ color: '#94a3b8' }}>No model loaded. Upload a TMDL export or connect Power BI in <b>Connect</b>, or reopen a past run from <b>History</b>.</p>
                     <div style={{ display: 'flex', gap: 12, marginTop: 12, flexWrap: 'wrap' }}>
-                      {sampleModels.map(m => (
-                        <motion.button key={m.id} className="btn-secondary" whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} onClick={() => setSelectedModel(m)}>{m.name}</motion.button>
-                      ))}
+                      <motion.button className="btn-secondary" whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} onClick={() => setPage('connect')}>Go to Connect</motion.button>
+                      <motion.button className="btn-secondary" whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} onClick={() => { setPage('history'); loadHistory(); }}>Go to History</motion.button>
                     </div>
                   </div>
                 ) : (
@@ -824,18 +859,18 @@ export default function App() {
                       <input type="checkbox" id="dryrun" checked={deployDryRun} onChange={e => setDeployDryRun(e.target.checked)} />
                       <label htmlFor="dryrun" style={{ fontSize: 13, color: '#94a3b8', cursor: 'pointer' }}>Dry run (translate only, don't deploy)</label>
                     </div>
-                    <p style={{ color: '#94a3b8', marginBottom: 16, fontSize: 13 }}>Select a model to migrate:</p>
-                    <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-                      {sampleModels.map(m => (
-                        <motion.button key={m.id} className="btn-primary" whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}
-                          onClick={() => { setSelectedModel(m); runMigration(m); }}>{m.name}</motion.button>
-                      ))}
-                      {selectedModel && !sampleModels.find(s => s.id === selectedModel.id) && (
+                    {selectedModel ? (
+                      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
                         <motion.button className="btn-primary" whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} onClick={() => runMigration(selectedModel)}>
-                          Migrate: {selectedModel.name}
+                          🔄 Migrate: {selectedModel.name}
                         </motion.button>
-                      )}
-                    </div>
+                        <span style={{ fontSize: 12, color: '#64748b' }}>{(selectedModel.tables || []).length} tables loaded</span>
+                      </div>
+                    ) : (
+                      <p style={{ color: '#94a3b8', fontSize: 13 }}>
+                        No model loaded. Upload a TMDL export or connect Power BI in <b>Connect</b>, then return here — or reopen a past run from <b>History</b>.
+                      </p>
+                    )}
                   </div>
                 )}
 
@@ -913,8 +948,8 @@ export default function App() {
                           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
                             {[
                               { label: 'Total Measures', value: pipelineSummary?.total_measures ?? '—', color: '#6366f1' },
-                              { label: 'Converted', value: pipelineSummary?.converted ?? '—', color: '#4ade80' },
-                              { label: 'Partial', value: pipelineSummary?.partial ?? '—', color: '#fbbf24' },
+                              { label: 'In view (deployed)', value: pipelineSummary?.deployed ?? '—', color: '#4ade80' },
+                              { label: 'Excluded from view', value: pipelineSummary?.not_deployed ?? '—', color: '#94a3b8' },
                               { label: 'Conversion Rate', value: pipelineSummary?.overall_conversion_rate != null ? `${pipelineSummary.overall_conversion_rate}%` : '—', color: '#a78bfa' },
                             ].map((c, i) => (
                               <div key={i} className="glass" style={{ padding: 16 }}>
@@ -927,11 +962,11 @@ export default function App() {
                             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 10 }}>Fact Groups</div>
                             <div style={{ maxHeight: 320, overflowY: 'auto' }}>
                               {factGroups.map(group => (
-                                <div key={group.name} style={{ display: 'grid', gridTemplateColumns: 'minmax(180px,1fr) repeat(4,90px)', gap: 10, padding: '8px 10px', borderBottom: '1px solid rgba(255,255,255,0.05)', alignItems: 'center', fontSize: 12 }}>
+                                <div key={group.name} style={{ display: 'grid', gridTemplateColumns: 'minmax(180px,1fr) repeat(4,100px)', gap: 10, padding: '8px 10px', borderBottom: '1px solid rgba(255,255,255,0.05)', alignItems: 'center', fontSize: 12 }}>
                                   <span style={{ fontWeight: 600 }}>{group.name}</span>
                                   <span>{group.total_measures} total</span>
-                                  <span style={{ color: '#4ade80' }}>{group.converted} converted</span>
-                                  <span style={{ color: '#fbbf24' }}>{group.partial} partial</span>
+                                  <span style={{ color: '#4ade80' }}>{group.deployed ?? group.converted} in view</span>
+                                  <span style={{ color: '#94a3b8' }}>{group.not_deployed || 0} not in view</span>
                                   <span className={`tag ${group.validation_status === 'OK' ? 'tag-success' : group.validation_status === 'WARNINGS' ? 'tag-warning' : 'tag-error'}`}>{group.validation_status}</span>
                                 </div>
                               ))}
@@ -1014,6 +1049,49 @@ export default function App() {
                     ))}
                   </div>
                 </motion.div>
+              </motion.div>
+            )}
+
+            {/* HISTORY */}
+            {page === 'history' && (
+              <motion.div key="history" variants={pageVariants} initial="initial" animate="animate" exit="exit" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <p style={{ color: '#94a3b8', fontSize: 13, margin: 0 }}>Past uploads and migration runs are saved and can be reopened — including after a reload or server restart.</p>
+                  <button className="btn-secondary" style={{ marginLeft: 'auto', fontSize: 12 }} onClick={loadHistory} disabled={historyLoading}>
+                    {historyLoading ? '…' : '↻ Refresh'}
+                  </button>
+                </div>
+
+                {history.length === 0 ? (
+                  <div className="glass" style={{ padding: 20, color: '#64748b', fontSize: 13 }}>
+                    {historyLoading ? 'Loading history…' : 'No migrations yet — run one from Connect → upload a TMDL export, then Migrate.'}
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {history.map((h, i) => {
+                      const failed = h.status === 'failed';
+                      return (
+                        <motion.div key={h.migration_id || i} className="glass" style={{ padding: '14px 16px', cursor: 'pointer', display: 'grid', gridTemplateColumns: 'minmax(160px,1.4fr) 1fr 1fr 120px', gap: 12, alignItems: 'center' }}
+                          variants={cardVariants} custom={i} initial="initial" animate="animate" whileHover="hover"
+                          onClick={() => openMigration(h.migration_id)}>
+                          <div>
+                            <div style={{ fontWeight: 600, fontSize: 14 }}>{h.model_name || 'Untitled model'}</div>
+                            <div style={{ fontSize: 10, color: '#64748b' }}>{h.migration_id}</div>
+                          </div>
+                          <div style={{ fontSize: 12, color: '#94a3b8' }}>
+                            <div>{h.catalog}.{h.schema}</div>
+                            <div style={{ fontSize: 10, color: '#64748b' }}>{h.tables} tables • {h.measures} measures</div>
+                          </div>
+                          <div style={{ fontSize: 11, color: '#64748b' }}>{h.created_at ? new Date(h.created_at).toLocaleString() : '—'}</div>
+                          <div style={{ display: 'flex', gap: 8, alignItems: 'center', justifySelf: 'end' }}>
+                            <span className={`tag ${failed ? 'tag-error' : 'tag-success'}`} style={{ fontSize: 10 }}>{h.status || '—'}</span>
+                            <span style={{ color: '#6366f1', fontSize: 12 }}>Open →</span>
+                          </div>
+                        </motion.div>
+                      );
+                    })}
+                  </div>
+                )}
               </motion.div>
             )}
 

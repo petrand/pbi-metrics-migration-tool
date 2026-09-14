@@ -229,6 +229,74 @@ def test_e4_pipeline_surfaces_rls():
     assert "SET ROW FILTER" in res.rls_scaffolding
 
 
+# ── E6: no measure is dropped without a warning/error ───────────────────────
+
+def _run(tables, relationships=None):
+    model = {"name": "M", "tables": tables, "relationships": relationships or []}
+    return MigrationPipeline().run(model, MigrationConfig(catalog="main", schema="s"))
+
+
+def test_build_spec_records_upstream_excluded_measure():
+    """A measure marked excluded upstream is recorded, not silently skipped."""
+    gen = MetricViewYAMLGenerator()
+    spec = gen.build_spec(
+        "M", "Sales", "main", "s",
+        tables=[{"name": "Sales", "columns": [], "measures": []}],
+        relationships=[],
+        translated_measures=[
+            {"name": "Skipped", "translated_sql": "SUM(source.amt)", "status": "excluded"},
+        ],
+    )
+    assert "Skipped" not in [m.name for m in spec.measures]
+    assert "Skipped" in spec.excluded_measures
+
+
+def test_generator_retains_skipped_view_exclusions():
+    """When a whole fact group's view is skipped (empty), its exclusions survive."""
+    tables = [{"name": "Weird", "columns": [],
+               "measures": [{"name": "Ratio", "expression": "Weird[a] + Weird[b]"}]}]
+    gen = MetricViewYAMLGenerator()
+    specs = gen.generate_from_model(_model(tables, []), "main", "s")
+    assert specs == []                       # empty view -> not emitted
+    assert "weird" in gen.skipped_exclusions  # ...but the drop is retained
+    assert "Ratio" in gen.skipped_exclusions["weird"]
+
+
+def test_pipeline_surfaces_excluded_measure_as_warning():
+    """A residual-DAX measure is excluded from the view AND surfaced as a warning."""
+    tables = [{"name": "Sales", "columns": [], "measures": [
+        {"name": "Good", "expression": "SUM(Sales[amt])"},
+        {"name": "Bad", "expression": "CALCULATE(SUM(Sales[amt]), VALUES(Sales[x]))"},
+    ]}]
+    res = _run(tables)
+    assert res.status == "complete"
+    assert any("Bad" in w for w in res.warnings), res.warnings
+    assert not res.errors                    # backstop must not fire for a clean run
+
+
+def test_pipeline_empty_view_group_not_silent():
+    """Every measure of a fully-excluded (skipped) fact group is still reported."""
+    tables = [{"name": "Weird", "columns": [],
+               "measures": [{"name": "Ratio", "expression": "Weird[a] + Weird[b]"}]}]
+    res = _run(tables)
+    assert any("Ratio" in w for w in res.warnings), res.warnings
+
+
+def test_pipeline_no_measure_dropped_without_report():
+    """Invariant: every input measure is either in a deployed view or reported."""
+    tables = [{"name": "Sales", "columns": [{"name": "Region", "dataType": "string"}],
+               "measures": [
+                   {"name": "Total", "expression": "SUM(Sales[amt])"},                     # deployed
+                   {"name": "Resid", "expression": "CALCULATE(SUM(Sales[amt]), VALUES(Sales[x]))"},  # excluded
+                   {"name": "Bare", "expression": "Sales[a] + Sales[b]"},                   # non-aggregating
+               ]}]
+    res = _run(tables)
+    reported = " ".join(res.warnings + res.errors)
+    deployed_yaml = " ".join(res.generated_yaml.values())
+    for name in ("Total", "Resid", "Bare"):
+        assert name in deployed_yaml or name in reported, f"{name} vanished silently"
+
+
 # ── E1.3: end-to-end SSAS assertion ─────────────────────────────────────────
 
 @pytest.mark.skipif(not os.path.isdir(SSAS_DIR), reason="SSAS_Sales fixture absent")

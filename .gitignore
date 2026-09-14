@@ -92,6 +92,8 @@ AGENTS.md
 CLAUDE.md 
 
 #data
+# Persisted migration history (backend/migration_store.py)
+/data/
 tmdl_code/
 metric_views/
 _*/

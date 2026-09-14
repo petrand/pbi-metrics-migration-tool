@@ -25,7 +25,7 @@ def reporter():
 
 
 def _make_measure_eval(name="Revenue", status="converted", confidence=95,
-                       issues=None, warnings=None):
+                       issues=None, warnings=None, deployed=True):
     return MeasureEvaluation(
         name=name,
         original_dax=f"SUM(Fact[{name}])",
@@ -34,6 +34,7 @@ def _make_measure_eval(name="Revenue", status="converted", confidence=95,
         confidence=confidence,
         issues=issues or [],
         warnings=warnings or [],
+        deployed=deployed,
     )
 
 
@@ -154,6 +155,21 @@ def test_evaluate_fact_group_conversion_rate_excludes_excluded():
     assert result.conversion_rate == pytest.approx(50.0, abs=0.1)
 
 
+def test_conversion_rate_counts_excluded_from_view_against_total():
+    """A converted measure excluded from the view (deployed=False) must lower
+    the conversion rate and be reported as not_deployed."""
+    r = reporter()
+    measures = [
+        _make_measure_eval("m1", status="converted", deployed=True),
+        _make_measure_eval("m2", status="converted", deployed=False),  # excluded from view
+    ]
+    result = r.evaluate_fact_group("Sales", "FactSales", measures)
+    # 1 of 2 actually in the view -> 50%, not 100%.
+    assert result.conversion_rate == pytest.approx(50.0, abs=0.1)
+    assert result.deployed == 1
+    assert result.not_deployed == 1
+
+
 def test_evaluate_fact_group_100_percent_when_all_converted():
     r = reporter()
     measures = [_make_measure_eval(f"m{i}", status="converted") for i in range(4)]
@@ -206,6 +222,8 @@ def _build_group(name, converted, unsupported, partial=0, excluded=0, manual_ove
         manual_overrides=manual_overrides,
         excluded=excluded,
         conversion_rate=round(rate, 1),
+        deployed=deployable,  # all converted/override measures are in-view here
+        not_deployed=0,
         measures=[],
     )
 

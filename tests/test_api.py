@@ -13,6 +13,20 @@ from main import app
 
 client = TestClient(app)
 
+# A small inline model, so migration tests don't depend on server-side samples.
+INLINE_MODEL = {
+    "name": "Sales Analytics",
+    "tables": [
+        {"name": "FactSales", "columns": [
+            {"name": "SalesKey", "dataType": "int64"},
+            {"name": "SalesAmount", "dataType": "decimal"},
+        ], "measures": [
+            {"name": "Total Sales", "expression": "SUM(FactSales[SalesAmount])"},
+        ]},
+    ],
+    "relationships": [],
+}
+
 
 # ── Health & Ready ────────────────────────────────────────────────────────────
 
@@ -46,66 +60,20 @@ def test_ready_capabilities_present():
     assert "capabilities" in response.json()
 
 
-def test_ready_sample_models_capability_true():
+def test_ready_no_sample_models_capability():
+    # The sample-models feature was removed; the capability must be gone too.
     response = client.get("/api/ready")
-    assert response.json()["capabilities"]["sample_models"] is True
+    assert "sample_models" not in response.json()["capabilities"]
+
+
+def test_samples_endpoint_removed_returns_404():
+    assert client.get("/api/samples").status_code == 404
+    assert client.get("/api/samples/sales").status_code == 404
 
 
 def test_ready_dax_translation_capability_true():
     response = client.get("/api/ready")
     assert response.json()["capabilities"]["dax_translation"] is True
-
-
-# ── Sample Models ─────────────────────────────────────────────────────────────
-
-def test_list_samples_returns_200():
-    response = client.get("/api/samples")
-    assert response.status_code == 200
-
-
-def test_list_samples_returns_three_models():
-    response = client.get("/api/samples")
-    models = response.json()["models"]
-    assert len(models) == 3
-
-
-def test_list_samples_has_sales_model():
-    response = client.get("/api/samples")
-    ids = [m["id"] for m in response.json()["models"]]
-    assert "sales" in ids
-
-
-def test_list_samples_has_healthcare_model():
-    response = client.get("/api/samples")
-    ids = [m["id"] for m in response.json()["models"]]
-    assert "healthcare" in ids
-
-
-def test_list_samples_has_finance_model():
-    response = client.get("/api/samples")
-    ids = [m["id"] for m in response.json()["models"]]
-    assert "finance" in ids
-
-
-def test_get_sample_sales_returns_200():
-    response = client.get("/api/samples/sales")
-    assert response.status_code == 200
-
-
-def test_get_sample_sales_has_correct_name():
-    response = client.get("/api/samples/sales")
-    assert response.json()["model"]["name"] == "Sales Analytics"
-
-
-def test_get_sample_sales_has_tables():
-    response = client.get("/api/samples/sales")
-    model = response.json()["model"]
-    assert len(model["tables"]) > 0
-
-
-def test_get_sample_nonexistent_returns_404():
-    response = client.get("/api/samples/nonexistent_model_xyz")
-    assert response.status_code == 404
 
 
 # ── DAX Translation ───────────────────────────────────────────────────────────
@@ -210,10 +178,9 @@ def test_dbx_validate_no_payload_returns_error():
 
 # ── Migration Pipeline ────────────────────────────────────────────────────────
 
-def test_migrate_with_sample_model_returns_200():
-    # Load the sales sample first
-    client.get("/api/samples/sales")
+def test_migrate_with_inline_model_returns_200():
     response = client.post("/api/migrate", json={
+        "model": INLINE_MODEL,
         "catalog": "main",
         "schema": "default",
         "dry_run": True,
@@ -222,8 +189,7 @@ def test_migrate_with_sample_model_returns_200():
 
 
 def test_migrate_without_model_returns_400():
-    # Ensure no model is in state by passing an empty model field
-    # Don't pass a model and ensure state is clear
+    # Ensure no model is in state, and don't pass one.
     from main import _state
     _state["current_model"] = None
     response = client.post("/api/migrate", json={})
@@ -231,23 +197,45 @@ def test_migrate_without_model_returns_400():
 
 
 def test_migrate_returns_migration_id():
-    client.get("/api/samples/sales")
-    response = client.post("/api/migrate", json={"dry_run": True})
+    response = client.post("/api/migrate", json={"model": INLINE_MODEL, "dry_run": True})
     assert "migration_id" in response.json()
 
 
 def test_migrate_returns_status():
-    client.get("/api/samples/sales")
-    response = client.post("/api/migrate", json={"dry_run": True})
+    response = client.post("/api/migrate", json={"model": INLINE_MODEL, "dry_run": True})
     assert "status" in response.json()
 
 
-def test_migrate_with_inline_model_returns_200():
-    sample = client.get("/api/samples/sales").json()["model"]
-    response = client.post("/api/migrate", json={
-        "model": sample,
-        "catalog": "main",
-        "schema": "test",
-        "dry_run": True,
-    })
+# ── Migration History / Persistence ─────────────────────────────────────────────
+
+def test_migration_persisted_and_listed():
+    mid = client.post("/api/migrate", json={"model": INLINE_MODEL, "dry_run": True}).json()["migration_id"]
+    listing = client.get("/api/migrations")
+    assert listing.status_code == 200
+    ids = [m["migration_id"] for m in listing.json()["migrations"]]
+    assert mid in ids
+
+
+def test_migration_record_reopenable_with_source_model():
+    mid = client.post("/api/migrate", json={"model": INLINE_MODEL, "dry_run": True}).json()["migration_id"]
+    record = client.get(f"/api/migrations/{mid}")
+    assert record.status_code == 200
+    data = record.json()
+    # Both the upload (source model) and the migration result are recoverable.
+    assert data["source_model"]["name"] == INLINE_MODEL["name"]
+    assert data["migration_id"] == mid
+    assert "status" in data
+
+
+def test_migration_report_survives_memory_eviction():
+    """A report is retrievable from the persisted store even if not in memory."""
+    from main import _state
+    mid = client.post("/api/migrate", json={"model": INLINE_MODEL, "dry_run": True}).json()["migration_id"]
+    _state["migrations"].pop(mid, None)  # simulate restart / eviction
+    response = client.get(f"/api/migrate/{mid}/report")
     assert response.status_code == 200
+    assert response.json()["migration_id"] == mid
+
+
+def test_get_unknown_migration_returns_404():
+    assert client.get("/api/migrations/does-not-exist").status_code == 404
