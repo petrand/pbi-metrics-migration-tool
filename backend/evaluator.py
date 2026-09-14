@@ -119,9 +119,22 @@ class FactGroupEvaluation:
 
     conversion_rate: float
     """
-    Percentage of measures that are either fully converted or have a manual
-    override: ``(converted + manual_overrides) / total_measures * 100``.
+    Percentage of measures successfully migrated into the deployed metric view:
+    ``(converted + manual_overrides that are actually in the view) /
+    (total - status-excluded) * 100``. A measure that translated but had to be
+    excluded from the view (``deployed=False``) does NOT count — it lowers the
+    rate — because it is not a usable result.
     """
+
+    deployed: int = 0
+    """Count of successfully-migrated measures actually in the deployed view
+    (converted / manual-override *and* not excluded) — the conversion-rate
+    numerator."""
+
+    not_deployed: int = 0
+    """Count of translated measures the generator excluded from the view
+    (candidates that couldn't be expressed as a metric-view measure). Distinct
+    from ``excluded``, which is intentional status-based skips."""
 
     measures: list[MeasureEvaluation] = field(default_factory=list)
     """Individual measure evaluations belonging to this group."""
@@ -163,6 +176,13 @@ class PipelineSummary:
     total_tables: int
     total_relationships: int
     total_dimensions: int
+
+    deployed: int = 0
+    """Measures migrated into a deployed view (conversion-rate numerator)."""
+
+    not_deployed: int = 0
+    """Translated measures excluded from the deployed view (candidates that
+    couldn't be expressed as a metric-view measure)."""
 
     fact_groups: list[FactGroupEvaluation] = field(default_factory=list)
 
@@ -363,7 +383,16 @@ class EvaluationReporter:
         overrides = sum(1 for m in measures if m.status == "manual_override")
         excluded = sum(1 for m in measures if m.status == "excluded")
 
-        deployable = converted + overrides
+        # A measure counts toward the conversion rate only if it both
+        # translated successfully AND actually landed in the deployed view. A
+        # converted measure the generator had to exclude (deployed=False) is not
+        # a usable result, so it lowers the rate.
+        deployable = sum(
+            1 for m in measures
+            if m.deployed is not False and m.status in ("converted", "manual_override")
+        )
+        # Candidates dropped from the view (not intentional status-based skips).
+        not_deployed = sum(1 for m in measures if m.deployed is False and m.status != "excluded")
         effective_total = total - excluded
         conversion_rate = (
             (deployable / effective_total * 100) if effective_total > 0 else 0.0
@@ -400,6 +429,8 @@ class EvaluationReporter:
             excluded=excluded,
             conversion_rate=round(conversion_rate, 1),
             measures=measures,
+            deployed=deployable,
+            not_deployed=not_deployed,
             dimensions_count=dims_count,
             joins_count=joins_count,
             validation_status=validation_status,
@@ -465,10 +496,12 @@ class EvaluationReporter:
             else sum(g.joins_count for g in fact_groups)
         )
 
-        deployable = converted + overrides
+        # Deployment-aware conversion: only measures that landed in a view count.
+        deployed_total = sum(g.deployed for g in fact_groups)
+        not_deployed_total = sum(g.not_deployed for g in fact_groups)
         effective_total = total - excluded
         overall_rate = (
-            (deployable / effective_total * 100) if effective_total > 0 else 0.0
+            (deployed_total / effective_total * 100) if effective_total > 0 else 0.0
         )
 
         completed_at = datetime.now(timezone.utc).isoformat()
@@ -484,6 +517,8 @@ class EvaluationReporter:
             total_tables=len(fact_groups),
             total_relationships=total_joins,
             total_dimensions=total_dims,
+            deployed=deployed_total,
+            not_deployed=not_deployed_total,
             fact_groups=fact_groups,
             duration_seconds=round(duration, 3),
             started_at=started_at,

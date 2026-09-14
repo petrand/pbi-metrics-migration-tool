@@ -16,7 +16,7 @@ from backend.dax_translator import DAXTranslator
 from backend.evaluator import EvaluationReporter, MeasureEvaluation
 from backend.overrides import Overrides, OverridesManager
 from backend.validator import MetricViewValidator
-from backend.yaml_generator import MetricViewYAMLGenerator
+from backend.yaml_generator import MetricViewYAMLGenerator, _sanitize_name
 from backend.dashboard_generator import DashboardGenerator
 from backend.lakeview_client import LakeviewClient
 from backend import rls_generator
@@ -68,6 +68,7 @@ class MigrationResult:
     completed_at: str = ""
     duration_ms: int = 0
     errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
     dashboard_id: str = ""
     dashboard_url: str = ""
     dashboard_spec: Optional[dict] = None
@@ -91,6 +92,7 @@ class MigrationResult:
             "completed_at": self.completed_at,
             "duration_ms": self.duration_ms,
             "errors": self.errors,
+            "warnings": self.warnings,
             "dashboard_id": self.dashboard_id,
             "dashboard_url": self.dashboard_url,
             "rls_notes": self.rls_notes,
@@ -229,6 +231,7 @@ class MigrationPipeline:
             # per-view info: excluded measures + converted dimension columns.
             excluded_by_source = {}
             dims_by_source = {}
+            deployed_by_source = {}
             for spec, yaml_str, ddl_str in gen_results:
                 group_name = spec.view_name.split(".")[-1] if spec.view_name else "default"
                 result.generated_yaml[group_name] = yaml_str
@@ -238,8 +241,16 @@ class MigrationPipeline:
                 dims_by_source[src_key] = [
                     {"name": d.name, "expr": d.expr} for d in getattr(spec, "dimensions", [])
                 ]
+                # Measures that actually made it into this deployable view.
+                deployed_by_source[src_key] = {m.name for m in getattr(spec, "measures", [])}
+            # Fact groups whose view was skipped entirely still carry exclusions
+            # that must be surfaced — merge them so no drop goes unreported.
+            for src_key, excl in getattr(self.yaml_gen, "skipped_exclusions", {}).items():
+                excluded_by_source.setdefault(src_key, {}).update(excl)
+                deployed_by_source.setdefault(src_key, set())
             self._excluded_by_source = excluded_by_source
             self._dims_by_source = dims_by_source
+            self._deployed_by_source = deployed_by_source
 
             self._notify("generate", 65, f"Generated {len(gen_results)} metric view(s)")
             self._complete_step(step, f"Generated {len(gen_results)} metric view DDL(s)")
@@ -283,19 +294,49 @@ class MigrationPipeline:
         try:
             fact_group_evals = []
             excluded_by_source = getattr(self, "_excluded_by_source", {})
+            deployed_by_source = getattr(self, "_deployed_by_source", None)
+            # Only enforce the per-measure "accounted for" invariant when the
+            # generate step actually completed; if it failed outright, that error
+            # is already recorded and per-measure errors would be redundant noise.
+            gen_ok = deployed_by_source is not None
+            deployed_by_source = deployed_by_source or {}
             for fact in [t for t in filtered_tables if t.get("measures")]:
-                src_key = fact.get("name", "").lower().replace(" ", "_")
+                # Use the same sanitizer the generator keys on, so the lookup
+                # never misses for names with spaces/special characters.
+                src_key = _sanitize_name(fact.get("name", ""))
                 excluded = excluded_by_source.get(src_key, {})
+                deployed = deployed_by_source.get(src_key, set())
                 measure_evals = []
                 for m in fact.get("measures", []):
-                    tr = all_translations.get(m["name"])
-                    if tr:
-                        me = self.evaluator.evaluate_measure(m["name"], m.get("expression", ""), tr)
-                        # Flag measures the generator dropped from the deployable view.
-                        if m["name"] in excluded:
-                            me.deployed = False
-                            me.exclusion_reason = excluded[m["name"]]
-                        measure_evals.append(me)
+                    name = m["name"]
+                    tr = all_translations.get(name)
+                    if tr is None:
+                        # No translation was produced — the measure is dropped.
+                        # Never let that happen silently.
+                        msg = f"{fact.get('name', '')}.{name}: dropped — no translation was produced"
+                        result.warnings.append(msg)
+                        logger.warning("Measure dropped: %s", msg)
+                        continue
+                    me = self.evaluator.evaluate_measure(name, m.get("expression", ""), tr)
+                    if name in excluded:
+                        # Generator excluded it from the deployable view.
+                        me.deployed = False
+                        me.exclusion_reason = excluded[name]
+                        me.warnings.append(f"Excluded from deployed view: {excluded[name]}")
+                        msg = f"{fact.get('name', '')}.{name}: excluded from view — {excluded[name]}"
+                        result.warnings.append(msg)
+                        logger.warning("Measure excluded: %s", msg)
+                    elif gen_ok and name not in deployed:
+                        # Backstop: generation completed but this measure is
+                        # neither in the deployed view nor explicitly excluded.
+                        # That is an unaccounted drop — surface it as an error,
+                        # never silently.
+                        me.deployed = False
+                        me.exclusion_reason = "dropped without a recorded reason (unexpected)"
+                        msg = f"{fact.get('name', '')}.{name}: dropped from view with no recorded reason"
+                        result.errors.append(msg)
+                        logger.error("Measure dropped without reason: %s", msg)
+                    measure_evals.append(me)
 
                 dims = getattr(self, "_dims_by_source", {}).get(src_key, [])
                 fg = self.evaluator.evaluate_fact_group(

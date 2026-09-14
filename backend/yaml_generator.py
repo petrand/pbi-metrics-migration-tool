@@ -299,6 +299,13 @@ class MetricViewYAMLGenerator:
         excluded: dict = {}
         for tm in translated_measures:
             if tm.get("status") in ("excluded",):
+                # Excluded upstream (e.g. failed translation, calculated-table or
+                # private measure). Record it so the drop is never silent — the
+                # pipeline surfaces every entry in `excluded_measures` as a warning.
+                excluded[tm["name"]] = (
+                    tm.get("exclusion_reason")
+                    or "excluded upstream (translation status = excluded)"
+                )
                 continue
             expr = tm.get("translated_sql") or tm.get("expr", "")
             # A partial translation can still contain residual DAX that is not
@@ -773,6 +780,11 @@ class MetricViewYAMLGenerator:
             List of (MetricViewSpec, yaml_str, ddl_str) tuples.
         """
         results = []
+        # Exclusions for fact groups whose view is skipped entirely (empty after
+        # exclusions). Their spec never reaches `results`, so stash the reasons
+        # here for the pipeline to surface — otherwise those measures would be
+        # dropped without any warning. Reset on each call.
+        self.skipped_exclusions: dict = {}
         tables = model.get("tables", [])
         relationships = model.get("relationships", [])
 
@@ -809,7 +821,13 @@ class MetricViewYAMLGenerator:
             # After excluding residual/window measures a fact group can end up
             # empty — skip it rather than emit an invalid view.
             if not spec.measures and not spec.dimensions:
-                logger.info("Skipping empty metric view for fact group '%s'", fact["name"])
+                src_key = spec.source.split(".")[-1] if spec.source else _sanitize_name(fact["name"])
+                self.skipped_exclusions[src_key] = dict(spec.excluded_measures)
+                logger.warning(
+                    "Skipping empty metric view for fact group '%s' — no deployable "
+                    "measures or dimensions; %d measure(s) excluded (see report)",
+                    fact["name"], len(spec.excluded_measures),
+                )
                 continue
 
             yaml_str = self.generate_yaml(spec)
