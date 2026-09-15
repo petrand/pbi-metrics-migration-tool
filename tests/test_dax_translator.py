@@ -247,7 +247,7 @@ def test_calculate_simple_filter_produces_filter_where():
     assert "FILTER (WHERE" in result.translated_sql
     assert "SUM(source.salesamount)" in result.translated_sql
     assert "source.region = 'West'" in result.translated_sql
-    assert "CALCULATE_simple_filter_to_FILTER_WHERE" in result.applied_transformations
+    assert "CALCULATE_filter_to_FILTER_WHERE" in result.applied_transformations
 
 
 def test_calculate_filter_all_produces_filter_where():
@@ -257,7 +257,7 @@ def test_calculate_filter_all_produces_filter_where():
         "FactSales",
     )
     assert "FILTER (WHERE" in result.translated_sql
-    assert "CALCULATE_FILTER_ALL_to_FILTER_WHERE" in result.applied_transformations
+    assert "CALCULATE_filter_to_FILTER_WHERE" in result.applied_transformations
 
 
 def test_calculate_filter_converts_dax_double_quotes():
@@ -379,3 +379,38 @@ def test_confidence_is_between_0_and_100():
 def test_status_is_valid_string():
     result = translator().translate("SUM(FactSales[SalesAmount])")
     assert result.status in ("converted", "partial", "unsupported", "manual_override", "excluded")
+
+
+# ── COUNTROWS(VALUES(...)) distinct-count idiom ──────────────────────────────
+
+def test_countrows_values_table_col_to_count_distinct():
+    result = translator().translate("COUNTROWS(VALUES(Sales[Region]))", "Sales")
+    assert result.translated_sql == "COUNT(DISTINCT source.region)"
+    assert result.status == "converted"
+    assert "COUNTROWS_VALUES_to_COUNT_DISTINCT" in result.applied_transformations
+
+
+def test_countrows_values_bare_col_to_count_distinct():
+    result = translator().translate("COUNTROWS(VALUES([Region]))", "Sales")
+    assert result.translated_sql == "COUNT(DISTINCT source.region)"
+
+
+def test_countrows_values_quoted_table_and_spaced_col():
+    result = translator().translate("COUNTROWS(VALUES('Sales Table'[Product Key]))", "Sales")
+    assert result.translated_sql == "COUNT(DISTINCT source.product_key)"
+
+
+def test_countrows_values_nested_in_divide():
+    result = translator().translate(
+        "DIVIDE(SUM(Sales[amt]), COUNTROWS(VALUES(Sales[cust])))", "Sales")
+    assert "COUNT(DISTINCT source.cust)" in result.translated_sql
+    assert "VALUES" not in result.translated_sql.upper()
+
+
+def test_filter_over_values_iterator_not_rewritten():
+    """A bare VALUES inside a FILTER iterator is NOT the distinct-count idiom and
+    must stay residual for manual review, not be rewritten to COUNT(DISTINCT)."""
+    result = translator().translate(
+        "CALCULATE(SUM(Sales[amt]), FILTER(VALUES(Sales[x]), Sales[x] > 0))", "Sales")
+    assert result.status != "converted"
+    assert "VALUES" in result.translated_sql.upper()

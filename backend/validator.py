@@ -224,6 +224,14 @@ class MetricViewValidator:
         """Validate a full CREATE VIEW DDL statement."""
         issues = []
 
+        # Plain table DDL is emitted alongside the metric views as a dependency
+        # the views read from (CREATE OR REPLACE TABLE ...). It is not a metric
+        # view, so metric-view validation does not apply — a well-formed CREATE
+        # TABLE is trivially valid here (skip rather than flag "Missing CREATE VIEW").
+        # Matches both `CREATE TABLE` and `CREATE OR REPLACE TABLE` (never VIEW).
+        if re.match(r'\s*CREATE\s+(?:OR\s+REPLACE\s+)?TABLE\b', ddl or '', re.IGNORECASE):
+            return ValidationResult(valid=True, issues=[])
+
         if not re.search(r'CREATE\s+(OR\s+REPLACE\s+)?VIEW', ddl, re.IGNORECASE):
             issues.append(ValidationIssue("error", "ddl",
                                           "Missing CREATE VIEW statement"))

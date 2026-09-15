@@ -165,6 +165,23 @@ class TMDLRole:
 
 
 @dataclass
+class TMDLPerspective:
+    """A Power BI perspective: a named subset of tables/measures. Perspectives
+    are metadata-only (a curated "view" of the model), so we capture the name
+    and how many tables it references for reporting."""
+
+    name: str
+    tables: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "tables": list(self.tables),
+            "tableCount": len(self.tables),
+        }
+
+
+@dataclass
 class SemanticModel:
     """Top-level container for a parsed TMDL semantic model."""
 
@@ -172,6 +189,7 @@ class SemanticModel:
     tables: List[TMDLTable] = field(default_factory=list)
     relationships: List[TMDLRelationship] = field(default_factory=list)
     roles: List[TMDLRole] = field(default_factory=list)
+    perspectives: List[TMDLPerspective] = field(default_factory=list)
     culture: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -182,6 +200,7 @@ class SemanticModel:
             "tables": [t.to_dict() for t in self.tables],
             "relationships": [r.to_dict() for r in self.relationships],
             "roles": [r.to_dict() for r in self.roles],
+            "perspectives": [p.to_dict() for p in self.perspectives],
         }
 
     def to_json(self, **kwargs) -> str:
@@ -203,11 +222,17 @@ _MEASURE_DEF_RE = re.compile(
     r"^measure\s+(?P<name>'[^']+'|\S+)\s*=\s*(?P<expr>.*)$"
 )
 
-# Matches a bare column definition:
+# Matches a column definition — both a stored column and a calculated column
+# (``column <name> = <DAX>``). The trailing ``dataType:`` line is read by
+# _parse_column, so calculated columns still get a real type. Capturing calc
+# columns matters because relationships/joins can key on them (e.g. a computed
+# composite key), and omitting them makes the generated table/view SQL reference
+# a column that doesn't exist:
 #   column SalesAmount
 #   column 'Order Date'
+#   column CustomerOrderNumberLine = 'Customer Orders'[CustomerOrderNumber] & ...
 _COLUMN_DEF_RE = re.compile(
-    r"^column\s+(?P<name>'[^']+'|\S+)$"
+    r"^column\s+(?P<name>'[^']+'|\S+)\s*(?:=\s*(?P<expr>.*))?$"
 )
 
 # Relationship column reference: ``FactSales.ProductKey`` or ``'Dim Date'.DateKey``
@@ -791,7 +816,48 @@ class TMDLParser:
             except Exception:
                 logger.exception("Error parsing role file %s -- skipping.", rf)
 
+        # Perspectives (perspectives/ subdirectory, perspectives.tmdl, or inline
+        # in model.tmdl). Metadata-only; captured for reporting.
+        perspective_files: List[Path] = []
+        perspectives_dir = root / "perspectives"
+        if perspectives_dir.is_dir():
+            perspective_files = sorted(perspectives_dir.glob("*.tmdl"))
+        elif (root / "perspectives.tmdl").exists():
+            perspective_files = [root / "perspectives.tmdl"]
+        elif model_file.exists():
+            perspective_files = [model_file]
+        for pf in perspective_files:
+            try:
+                raw = pf.read_text(encoding="utf-8", errors="replace")
+                model.perspectives.extend(self._parse_perspectives(raw))
+            except Exception:
+                logger.exception("Error parsing perspective file %s -- skipping.", pf)
+
         return model
+
+    def _parse_perspectives(self, content: str) -> List[TMDLPerspective]:
+        """Parse ``perspective <Name>`` blocks. Each may list ``perspectiveTable
+        <Table>`` entries (which in turn nest ``perspectiveMeasure``/``Column``);
+        we record the perspective name and the tables it includes."""
+        perspectives: List[TMDLPerspective] = []
+        current: Optional[TMDLPerspective] = None
+        current_depth = 0
+        for line in _tokenise(content):
+            text = line.text
+            if text.startswith("perspective "):
+                current = TMDLPerspective(name=_strip_quotes(text[len("perspective "):].strip()))
+                current_depth = line.depth
+                perspectives.append(current)
+                continue
+            if current is None:
+                continue
+            # Left the perspective block (dedented back to/below its header).
+            if line.depth <= current_depth:
+                current = None
+                continue
+            if text.startswith("perspectiveTable "):
+                current.tables.append(_strip_quotes(text[len("perspectiveTable "):].strip()))
+        return perspectives
 
     def _parse_roles(self, content: str) -> List[TMDLRole]:
         """Parse one or more ``role`` blocks from TMDL content.
@@ -854,6 +920,7 @@ class TMDLParser:
         self._parse_model_metadata(content, model)
         model.tables.extend(self._parse_tables(content))
         model.relationships.extend(self._parse_relationships(content))
+        model.perspectives.extend(self._parse_perspectives(content))
         return model
 
     # ------------------------------------------------------------------

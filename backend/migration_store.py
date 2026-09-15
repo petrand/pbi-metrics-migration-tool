@@ -76,6 +76,7 @@ def list_summaries() -> list:
             continue
         out.append({
             "migration_id": rec.get("migration_id"),
+            "run_name": rec.get("run_name", ""),
             "model_name": rec.get("model_name", ""),
             "status": rec.get("status", ""),
             "created_at": rec.get("created_at", ""),

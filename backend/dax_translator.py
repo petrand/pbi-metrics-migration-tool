@@ -34,6 +34,7 @@ class TranslationResult:
     issues: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     window_spec: Optional[dict] = None
+    rls_applied: bool = False
 
     def to_dict(self) -> dict:
         d = {
@@ -44,6 +45,7 @@ class TranslationResult:
             "applied_transformations": self.applied_transformations,
             "issues": self.issues,
             "warnings": self.warnings,
+            "rls_applied": self.rls_applied,
         }
         if self.window_spec:
             d["window_spec"] = self.window_spec
@@ -92,18 +94,40 @@ _SQL_KEYWORDS = frozenset({
 class DAXTranslator:
     """Translates DAX expressions to Databricks SQL for metric views."""
 
-    def __init__(self, relationships: List[dict] = None, known_measures: Dict[str, str] = None):
+    def __init__(self, relationships: List[dict] = None, known_measures: Dict[str, str] = None,
+                 security_tables: List[str] = None, security_measures: List[str] = None):
         """
         Args:
             relationships: List of relationship dicts with 'from' and 'to' keys.
             known_measures: Dict mapping measure names to their translated SQL.
+            security_tables: Names of RLS / measure-security tables. A bare
+                CALCULATE filter argument naming one of these (or any table) is a
+                context transition with no metric-view equivalent and is dropped;
+                when the table is a security table the measure is flagged
+                ``rls_applied`` (its in-measure security gate was removed for
+                conversion — enforce access via the view's row filters instead).
+            security_measures: Names of permission-check measures (home table is
+                a security table). A guard ``IF([SecMeasure] <op> n, expr, BLANK())``
+                is reduced to ``expr`` and the measure flagged ``rls_applied``.
         """
         self._relationships = relationships or []
         self._known_measures = known_measures or {}
+        self._security_tables = {self._norm_name(t) for t in (security_tables or [])}
+        self._security_measures = {self._norm_name(m) for m in (security_measures or [])}
+        self._rls_applied = False
+        # Normalised measure name -> original name, so a qualified reference
+        # written as 'Table'[Measure Name] can be recognised as a measure (and
+        # rendered MEASURE(`...`)) rather than mistaken for a fact column.
+        self._measure_names_norm = {self._norm_name(n): n for n in self._known_measures}
         self._join_map = self._build_join_map()
         self._transformations = []
         self._issues = []
         self._warnings = []
+
+    @staticmethod
+    def _norm_name(name: str) -> str:
+        """Normalise a measure name for case/whitespace-insensitive matching."""
+        return re.sub(r'\s+', ' ', name or '').strip().lower()
 
     def _build_join_map(self) -> Dict[str, str]:
         """Build a mapping of Table.Column -> join_alias.column from relationships."""
@@ -133,6 +157,7 @@ class DAXTranslator:
         self._transformations = []
         self._issues = []
         self._warnings = []
+        self._rls_applied = False
 
         if not dax_expr or not dax_expr.strip():
             return TranslationResult(
@@ -145,12 +170,15 @@ class DAXTranslator:
 
         if measures:
             self._known_measures.update(measures)
+            for name in measures:
+                self._measure_names_norm[self._norm_name(name)] = name
 
         sql = dax_expr.strip()
 
         # Multi-pass translation
         sql = self._pass_normalize(sql)
         sql = self._pass_var_return(sql)
+        sql = self._pass_strip_rls_gate(sql)
         sql = self._pass_time_intelligence(sql)
         window = self._extract_window_spec(dax_expr)
         sql = self._pass_calculate(sql, table_name)
@@ -168,6 +196,14 @@ class DAXTranslator:
         # Determine status and confidence
         status, confidence = self._compute_status(sql, dax_expr)
 
+        # A single, uniform note whenever in-measure RLS was removed (either the
+        # permission-gate IF or a security-table CALCULATE filter arg).
+        if self._rls_applied:
+            self._warnings.append(
+                "RLS was previously applied in-measure; the security gate was "
+                "removed for conversion — enforce access via the view's row filters"
+            )
+
         return TranslationResult(
             original_dax=dax_expr,
             translated_sql=sql,
@@ -177,6 +213,7 @@ class DAXTranslator:
             issues=list(self._issues),
             warnings=list(self._warnings),
             window_spec=window,
+            rls_applied=self._rls_applied,
         )
 
     def translate_batch(self, measures: List[dict], table_name: str = "") -> List[TranslationResult]:
@@ -191,6 +228,12 @@ class DAXTranslator:
         """
         # Build measure name -> expression map
         measure_map = {m["name"]: m.get("expression", "") for m in measures}
+
+        # Register all measure names (not just resolved ones) so qualified
+        # references 'Table'[Measure] resolve to MEASURE(`...`) during ref
+        # translation. See _norm_name / _translate_table_col_refs.
+        for name in measure_map:
+            self._measure_names_norm[self._norm_name(name)] = name
 
         # Multi-pass: resolve cross-references iteratively
         results = {}
@@ -280,6 +323,54 @@ class DAXTranslator:
             self._transformations.append("var_return_inline")
             return result
 
+        return sql
+
+    def _pass_strip_rls_gate(self, sql: str) -> str:
+        """Remove in-measure row-level-security gating.
+
+        Power BI models often gate a measure behind a permission check, e.g.
+        ``IF([Count Measures E] > 0, CALCULATE(SUM([CostE]), 'Measure Security'),
+        BLANK())`` — where ``Count Measures E`` counts rows of a security table.
+        A metric view can't express per-user security inside a measure (that is
+        the job of the view's row filters), so we reduce the guard to its
+        then-branch and flag the measure ``rls_applied``. The bare security-table
+        CALCULATE filter arg is dropped later in _pass_calculate (also flagged).
+        """
+        if not self._security_measures:
+            return sql
+
+        guard = 0
+        if_re = re.compile(r'\bIF\s*\(', re.IGNORECASE)
+        while guard < 200:
+            guard += 1
+            m = if_re.search(sql)
+            if not m:
+                break
+            open_idx = m.end() - 1
+            close_idx = self._find_balanced_paren(sql, open_idx)
+            if close_idx == -1:
+                break
+            args = self._split_top_level_args(sql[open_idx + 1:close_idx])
+            if len(args) < 2:
+                break
+            cond = args[0].strip()
+            # The condition must be a permission check on a security measure:
+            #   [Sec Measure] <op> <number>
+            ref = RE_MEASURE_REF.search(cond)
+            gate = bool(ref and self._norm_name(ref.group(1)) in self._security_measures
+                        and self._CMP_OP.search(cond))
+            if not gate:
+                # Not an RLS gate — leave this IF for the normal conditional pass.
+                # Advance past it so we don't loop forever on the same match.
+                marker = "\x00IF\x00"
+                sql = sql[:m.start()] + marker + sql[m.start() + 2:]
+                continue
+            # Reduce the guard to its then-branch (drop the security gate).
+            self._rls_applied = True
+            self._transformations.append("RLS_gate_stripped")
+            sql = sql[:m.start()] + args[1].strip() + sql[close_idx + 1:]
+
+        sql = sql.replace("\x00IF\x00", "IF")
         return sql
 
     def _pass_time_intelligence(self, sql: str) -> str:
@@ -485,7 +576,6 @@ class DAXTranslator:
 
             if len(args) >= 2:
                 measure_expr = args[0]
-                filter_expr = args[1]
 
                 # Time-intelligence filter: CALCULATE(m, DATESYTD(...) |
                 # SAMEPERIODLASTYEAR(...) | ...). The period logic is carried by
@@ -498,30 +588,37 @@ class DAXTranslator:
                     pos = close_idx + 1
                     continue
 
-                # Handle FILTER(ALL(table), condition)
-                filter_all = re.match(
-                    r'FILTER\s*\(\s*ALL\s*\(\s*[\w\s]+\s*\)\s*,\s*(.+)\s*\)$',
-                    filter_expr, re.IGNORECASE | re.DOTALL
-                )
-                if filter_all:
-                    condition = filter_all.group(1).strip()
-                    condition = self._to_filter_condition(condition, table_name)
-                    self._transformations.append("CALCULATE_FILTER_ALL_to_FILTER_WHERE")
-                    result_parts.append(f"{measure_expr} FILTER (WHERE {condition})")
-                    pos = close_idx + 1
-                    continue
+                # Translate EVERY filter argument (not just the first) to a SQL
+                # predicate and AND them into a single FILTER (WHERE ...). Each
+                # predicate is parenthesised so OR-groups (||) and mixed
+                # operators keep their precedence. Predicates that can't be
+                # expressed (nested table functions, VALUES-iteration, ...) make
+                # the whole CALCULATE fall through to the manual-review path.
+                preds: List[str] = []
+                translatable = True
+                for farg in args[1:]:
+                    pred = self._calc_predicate(farg, table_name)
+                    if pred is None:
+                        translatable = False
+                        break
+                    if pred:  # empty string = a dropped filter (e.g. USERELATIONSHIP)
+                        preds.append(pred)
 
-                # Simple column filter: Table[Col] = value
-                col_filter = RE_TABLE_COL.search(filter_expr)
-                if col_filter and '=' in filter_expr:
-                    condition = self._to_filter_condition(filter_expr, table_name)
-                    self._transformations.append("CALCULATE_simple_filter_to_FILTER_WHERE")
-                    result_parts.append(f"{measure_expr} FILTER (WHERE {condition})")
+                if translatable:
+                    if preds:
+                        condition = " AND ".join(preds)
+                        self._transformations.append("CALCULATE_filter_to_FILTER_WHERE")
+                        result_parts.append(f"{measure_expr} FILTER (WHERE {condition})")
+                    else:
+                        # All filter args were droppable (context transitions with
+                        # no row-filter effect) — the measure stands alone.
+                        self._transformations.append("CALCULATE_filters_dropped")
+                        result_parts.append(measure_expr)
                     pos = close_idx + 1
                     continue
 
                 # Complex CALCULATE - flag for review
-                self._issues.append(f"Complex CALCULATE pattern requires manual review: {filter_expr[:80]}")
+                self._issues.append(f"Complex CALCULATE pattern requires manual review: {inner[:80]}")
                 self._transformations.append("CALCULATE_complex_flagged")
 
             # Could not translate - keep original
@@ -529,6 +626,86 @@ class DAXTranslator:
             pos = close_idx + 1
 
         return ''.join(result_parts)
+
+    # Comparison operators that mark a scalar CALCULATE filter predicate.
+    _CMP_OP = re.compile(r'(<>|!=|>=|<=|=|<|>)')
+    # DAX table functions that must not appear in a FILTER's table argument for
+    # us to treat it as a plain row filter (VALUES-iteration etc. is not one).
+    _NON_TABLE_FILTER = re.compile(
+        r'\b(VALUES|ADDCOLUMNS|SELECTCOLUMNS|SUMMARIZE|TOPN|ALLSELECTED|'
+        r'ALLEXCEPT|CROSSJOIN|GENERATE)\s*\(', re.IGNORECASE)
+    # DAX calls that can't survive inside a SQL predicate.
+    _RESIDUAL_IN_PRED = re.compile(
+        r'\b(CALCULATE|VALUES|ALLEXCEPT|EARLIER|ADDCOLUMNS|SELECTCOLUMNS|'
+        r'RELATEDTABLE|SUMMARIZE|TOPN)\s*\(', re.IGNORECASE)
+
+    def _calc_predicate(self, arg: str, table_name: str) -> Optional[str]:
+        """Translate one CALCULATE filter argument into a SQL WHERE predicate.
+
+        Returns:
+            - a parenthesised SQL predicate string, or
+            - ``""`` when the argument is a context transition with no row-filter
+              effect and should be dropped (e.g. USERELATIONSHIP), or
+            - ``None`` when the argument can't be expressed as a plain filter
+              (caller then flags the whole CALCULATE for manual review).
+        """
+        a = arg.strip()
+
+        # USERELATIONSHIP(a, b): activates an alternate relationship. No Metric
+        # View equivalent — drop it, keep the other predicates, and warn.
+        if re.match(r'USERELATIONSHIP\s*\(', a, re.IGNORECASE):
+            self._warnings.append(
+                "USERELATIONSHIP dropped — the alternate relationship has no "
+                "Metric View equivalent; verify the join path or supply a "
+                "measure_override"
+            )
+            self._transformations.append("USERELATIONSHIP_dropped")
+            return ""
+
+        # FILTER(<table|ALL(table)>, <condition>): keep the condition, drop the
+        # table scope. Reject FILTER over a table *function* (VALUES(), etc.) —
+        # that is an iteration, not a row filter.
+        if re.match(r'FILTER\s*\(', a, re.IGNORECASE):
+            open_idx = a.index('(')
+            close_idx = self._find_balanced_paren(a, open_idx)
+            if close_idx == -1:
+                return None
+            fargs = self._split_top_level_args(a[open_idx + 1:close_idx])
+            if len(fargs) != 2:
+                return None
+            t0 = fargs[0].strip()
+            table_ok = bool(
+                re.fullmatch(r"ALL\s*\(\s*'?[\w ]+'?\s*\)", t0, re.IGNORECASE)
+                or re.fullmatch(r"'?[\w ]+'?", t0)
+            )
+            if not table_ok or self._NON_TABLE_FILTER.search(t0):
+                return None
+            cond = fargs[1].strip()
+            if re.search(r'\b(FILTER|CALCULATE)\s*\(', cond, re.IGNORECASE):
+                return None  # nested filter/calculate — too complex
+            return f"({self._to_filter_condition(cond, table_name)})"
+
+        # Scalar predicate: Table[Col] <op> value (any comparison operator).
+        if self._CMP_OP.search(a):
+            if self._RESIDUAL_IN_PRED.search(a):
+                return None
+            return f"({self._to_filter_condition(a, table_name)})"
+
+        # A bare table name as a filter argument — CALCULATE(m, Sales) or
+        # CALCULATE(m, 'Measure Security') — is a context transition with no
+        # metric-view equivalent, so drop it. If it names a security table, the
+        # measure carried in-measure RLS: flag it (removed for conversion, to be
+        # enforced by the view's row filters instead).
+        bare = re.fullmatch(r"'?([A-Za-z_][\w ]*)'?", a)
+        if bare and '[' not in a and '(' not in a:
+            if self._norm_name(bare.group(1)) in self._security_tables:
+                self._rls_applied = True
+                self._transformations.append("RLS_table_filter_dropped")
+            else:
+                self._transformations.append("table_filter_arg_dropped")
+            return ""
+
+        return None
 
     def _is_time_intel(self, expr: str) -> bool:
         """True if *expr* contains a DAX time-intelligence function."""
@@ -604,6 +781,25 @@ class DAXTranslator:
             lambda m: f"MAX(source.{m.group(2).lower().replace(' ', '_')})",
             sql, flags=re.IGNORECASE
         )
+
+        # COUNTROWS(VALUES(Table[Col])) -> COUNT(DISTINCT col). This is the
+        # canonical DAX distinct-count idiom (equivalent to DISTINCTCOUNT). Must
+        # run BEFORE the bare COUNTROWS(Table) rule. Only the COUNTROWS(VALUES(col))
+        # wrapper is rewritten — a bare VALUES(col) or FILTER(VALUES(col), ...)
+        # iterator is left as residual DAX for manual review, since a table-valued
+        # distinct set has no scalar SQL equivalent inside a metric-view measure.
+        sql, _n_tv = re.subn(
+            r"\bCOUNTROWS\s*\(\s*VALUES\s*\(\s*'?(\w[\w\s]*?)'?\[(\w[\w\s]*?)\]\s*\)\s*\)",
+            lambda m: f"COUNT(DISTINCT source.{m.group(2).lower().replace(' ', '_')})",
+            sql, flags=re.IGNORECASE,
+        )
+        sql, _n_bc = re.subn(
+            r"\bCOUNTROWS\s*\(\s*VALUES\s*\(\s*\[(\w[\w\s]*?)\]\s*\)\s*\)",
+            lambda m: f"COUNT(DISTINCT source.{m.group(1).lower().replace(' ', '_')})",
+            sql, flags=re.IGNORECASE,
+        )
+        if _n_tv or _n_bc:
+            self._transformations.append("COUNTROWS_VALUES_to_COUNT_DISTINCT")
 
         # COUNTROWS(Table)
         sql = re.sub(
@@ -989,6 +1185,12 @@ class DAXTranslator:
                 last_word = stripped.split()[-1] if stripped.split() else stripped
                 if " " in stripped or last_word.upper() in _SQL_KEYWORDS:
                     return raw
+            # A qualified reference 'Table'[Name] where Name is a known measure
+            # is a measure composition, not a fact column — emit MEASURE(`...`).
+            measure_name = self._measure_names_norm.get(self._norm_name(match.group(2)))
+            if measure_name:
+                self._transformations.append("qualified_measure_ref")
+                return f"MEASURE(`{measure_name}`)"
             tbl = tbl_raw.strip("'").lower().replace(" ", "_")
             col = match.group(2).lower().replace(" ", "_")
             fact_lower = table_name.lower().replace(" ", "_") if table_name else ""
@@ -1019,6 +1221,11 @@ class DAXTranslator:
         condition = self._translate_table_col_refs(condition.strip(), table_name)
         # DAX uses double quotes for string literals; SQL uses single quotes.
         condition = re.sub(r'"([^"]*)"', r"'\1'", condition)
+        # DAX BLANK() comparisons map to SQL NULL tests.
+        condition = re.sub(r'\s*<>\s*BLANK\s*\(\s*\)', ' IS NOT NULL', condition, flags=re.IGNORECASE)
+        condition = re.sub(r'\s*!=\s*BLANK\s*\(\s*\)', ' IS NOT NULL', condition, flags=re.IGNORECASE)
+        condition = re.sub(r'\s*=\s*BLANK\s*\(\s*\)', ' IS NULL', condition, flags=re.IGNORECASE)
+        condition = re.sub(r'\bBLANK\s*\(\s*\)', 'NULL', condition, flags=re.IGNORECASE)
         return condition
 
     def _pass_measure_refs(self, sql: str) -> str:
