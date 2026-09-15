@@ -256,8 +256,11 @@ def test_prune_measure_referencing_missing_column():
     assert "ghost" in spec.excluded_measures["Bad"]
 
 
-def test_prune_skips_validation_for_unknown_tables():
-    """A ref to a table not in known_columns can't be validated, so it's kept."""
+def test_measure_referencing_undeclared_alias_is_excluded():
+    """A measure whose expr references an alias that is neither `source` nor a
+    declared join in this view (here `dim`, with no relationship) cannot resolve
+    at deploy (UNRESOLVED_COLUMN on the alias), so it is excluded — while a
+    measure using only `source` columns is kept."""
     gen = MetricViewYAMLGenerator()
     spec = gen.build_spec(
         "M", "Sales", "main", "s",
@@ -265,10 +268,14 @@ def test_prune_skips_validation_for_unknown_tables():
         relationships=[],
         translated_measures=[
             {"name": "X", "translated_sql": "SUM(source.amt) FILTER (WHERE dim.flag = 1)"},
+            {"name": "OK", "translated_sql": "SUM(source.amt)"},
         ],
-        known_columns={"sales": {"amt"}},  # 'dim' unknown -> not validated
+        known_columns={"sales": {"amt", "flag"}},
     )
-    assert "X" in [m.name for m in spec.measures]
+    names = [m.name for m in spec.measures]
+    assert "X" not in names        # references undeclared alias `dim`
+    assert "OK" in names           # only `source` -> valid
+    assert "not joined in this view" in spec.excluded_measures.get("X", "")
 
 
 def test_source_schema_separates_source_from_view():

@@ -359,3 +359,47 @@ def test_measure_with_aggregate_in_filter_is_excluded():
     names = [m.name for m in spec.measures]
     assert "Historical Count" not in names
     assert "FILTER (WHERE" in spec.excluded_measures.get("Historical Count", "")
+
+
+# ── Window order referencing a column absent from fact + joins ────────────────
+
+def test_window_order_absent_everywhere_excludes_measure():
+    """A window measure ordering by a column that exists on neither the fact nor
+    any joined table has no dimension to order by; exposing `source.<col>` would
+    fail deploy (UNRESOLVED_COLUMN), so the measure is excluded instead."""
+    gen = _gen()
+    spec = gen.build_spec(
+        "M", "Product", "main", "gold",
+        tables=[{"name": "Product", "columns": [{"name": "Amount", "dataType": "double"}],
+                 "measures": []}],
+        relationships=[],
+        translated_measures=[
+            {"name": "YTD", "translated_sql": "SUM(source.amount)",
+             "status": "converted", "window": {"order": "date", "range": "cumulative"}},
+        ],
+        known_columns={"product": {"amount"}},  # no 'date' anywhere
+    )
+    assert "YTD" not in [m.name for m in spec.measures]
+    assert "window orders by 'date'" in spec.excluded_measures.get("YTD", "")
+    # And no bogus source.date dimension leaked in.
+    assert not any(d.expr == "source.date" for d in spec.dimensions)
+
+
+def test_window_order_on_fact_column_is_kept():
+    """When the fact DOES have the order column, the window measure is kept and
+    the fact column is exposed as a dimension."""
+    gen = _gen()
+    spec = gen.build_spec(
+        "M", "Sales", "main", "gold",
+        tables=[{"name": "Sales", "columns": [
+            {"name": "Amount", "dataType": "double"},
+            {"name": "Date", "dataType": "date"}], "measures": []}],
+        relationships=[],
+        translated_measures=[
+            {"name": "YTD", "translated_sql": "SUM(source.amount)",
+             "status": "converted", "window": {"order": "date", "range": "cumulative"}},
+        ],
+        known_columns={"sales": {"amount", "date"}},
+    )
+    assert "YTD" in [m.name for m in spec.measures]
+    assert any(d.expr == "source.date" for d in spec.dimensions)

@@ -258,12 +258,24 @@ class MigrationPipeline:
         step = self._start_step("generate")
         result.steps.append(step)
         try:
+            # Real column sets per table (sanitized to match emitted refs) so the
+            # generator can prune measures/dimensions/joins referencing columns
+            # that don't exist on the physically-loaded tables — the TMDL model
+            # can drift from what actually gets created/queried.
+            known_columns = {
+                _sanitize_name(t.get("name", "")): {
+                    _sanitize_name(c.get("name", ""))
+                    for c in t.get("columns", []) if c.get("name")
+                }
+                for t in filtered_tables if t.get("name")
+            }
             gen_results = self.yaml_gen.generate_from_model(
                 model={"name": model.get("name", ""), "tables": filtered_tables,
                        "relationships": relationships},
                 catalog=config.catalog,
                 schema=config.schema,
                 convert_nested_windows=config.convert_nested_windows,
+                known_columns=known_columns,
             )
             # The generated metric views read from physical tables that must
             # exist first. Prepend `CREATE TABLE IF NOT EXISTS` DDL for every

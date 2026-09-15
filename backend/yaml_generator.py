@@ -486,6 +486,31 @@ class MetricViewYAMLGenerator:
                 kept.append(m)
             spec.measures = kept
 
+        # ── Drop references to undeclared aliases ──
+        # A measure/dimension may reference `<alias>.<col>` for a table this fact
+        # does NOT join in this view (e.g. a DAX filter on another fact's columns,
+        # like `sales.customercare` inside a home_sales measure). That alias is
+        # neither `source` nor a declared join here, so the view fails at deploy
+        # with UNRESOLVED_COLUMN on the alias. Exclude such measures/dimensions.
+        # Runs after join pruning above so a join dropped for a missing key is not
+        # treated as a valid alias. Independent of `known_columns`.
+        valid_aliases = {"source", fact_table_lower} | self._reachable_join_aliases(spec.joins)
+        spec.dimensions = [
+            d for d in spec.dimensions
+            if not self._refs_undeclared_alias(d.expr, valid_aliases)
+        ]
+        kept = []
+        for m in spec.measures:
+            bad = self._refs_undeclared_alias(m.expr, valid_aliases)
+            if bad:
+                excluded[m.name] = (
+                    "references table alias(es) not joined in this view: "
+                    + ", ".join(bad)
+                )
+                continue
+            kept.append(m)
+        spec.measures = kept
+
         # A window measure's `order` must reference a declared dimension. Time
         # -intelligence measures order by a fact-table date column, which is not
         # otherwise exposed as a dimension, so add one where it is missing.
@@ -496,6 +521,8 @@ class MetricViewYAMLGenerator:
         # rewrite the order to that dimension's real name; otherwise expose the
         # fact-table order column as a new dimension.
         dim_by_lower = {d.name.lower(): d.name for d in spec.dimensions}
+        valid_join_aliases = self._reachable_join_aliases(spec.joins)
+        order_unresolved: dict = {}
         for m in spec.measures:
             for w in (m.window if isinstance(m.window, list) else [m.window]):
                 if not isinstance(w, dict):
@@ -507,9 +534,37 @@ class MetricViewYAMLGenerator:
                 if match:
                     w["order"] = match  # align to the existing dimension name
                     continue
-                spec.dimensions.append(MetricViewDimension(
-                    name=order, expr=f"source.{order}"))
-                dim_by_lower[str(order).lower()] = order
+                ord_col = _sanitize_name(str(order))
+                fact_cols = known_columns.get(fact_table_lower) if known_columns else None
+                # Expose the fact-table order column as a dimension — but only if
+                # the fact actually has it. When columns are known and it does
+                # not, look for it on a joined table; if it exists nowhere in the
+                # view, the window can't be ordered, so exclude the measure rather
+                # than emit a dimension referencing a column that doesn't exist
+                # (which fails the whole view's deploy with UNRESOLVED_COLUMN).
+                if fact_cols is None or ord_col in fact_cols:
+                    spec.dimensions.append(MetricViewDimension(
+                        name=order, expr=f"source.{ord_col}"))
+                    dim_by_lower[str(order).lower()] = order
+                    w["order"] = order
+                    continue
+                alias = next(
+                    (a for a in valid_join_aliases
+                     if ord_col in (known_columns.get(a) or set())), None)
+                if alias:
+                    spec.dimensions.append(MetricViewDimension(
+                        name=order, expr=f"{alias}.{ord_col}"))
+                    dim_by_lower[str(order).lower()] = order
+                    w["order"] = order
+                    continue
+                order_unresolved[m.name] = str(order)
+        if order_unresolved:
+            spec.measures = [m for m in spec.measures if m.name not in order_unresolved]
+            for name, order in order_unresolved.items():
+                excluded[name] = (
+                    f"window orders by '{order}', a column absent from the fact "
+                    "table and every joined table in this view"
+                )
 
         # Prior-period of a windowed measure (e.g. SPLY of MTD GP %) arrives as a
         # measure whose window carries an `offset` and whose expr references
@@ -607,6 +662,22 @@ class MetricViewYAMLGenerator:
             if col_clean not in cols:
                 missing.append(f"{alias}.{col_clean}")
         return missing
+
+    @staticmethod
+    def _refs_undeclared_alias(expr: str, valid_aliases: set) -> list:
+        """Return the sorted, de-duped alias names in ``<alias>.<col>`` references
+        of *expr* that are not in *valid_aliases* (``source``, the fact table, or
+        a declared join). Such a reference points at a table this view does not
+        expose and cannot resolve at deploy time. A ``a.b`` pair whose ``b`` is
+        itself a valid alias is a snowflake chain link (validated by its own
+        segment), not a stray reference."""
+        if not expr:
+            return []
+        bad = set()
+        for alias, col in re.findall(r'([A-Za-z_]\w*)\.(`[^`]+`|[A-Za-z_]\w*)', expr):
+            if alias not in valid_aliases:
+                bad.add(alias)
+        return sorted(bad)
 
     @staticmethod
     def _topo_order_measures(measures: list) -> list:
