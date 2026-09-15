@@ -286,6 +286,23 @@ def test_source_schema_separates_source_from_view():
     assert spec.view_name == "cat.views.sales_metric_view"
 
 
+def test_dim_schema_routes_dimension_joins_separately():
+    """Dimension (no-DAX) join targets can live in a different schema than the
+    fact source tables — fact from source_schema, dim join from dim_schema."""
+    gen = MetricViewYAMLGenerator()
+    spec = gen.build_spec(
+        "M", "Sales", "cat", "views",
+        tables=[{"name": "Sales", "columns": [], "measures": []},
+                {"name": "Customer", "columns": [{"name": "Name", "dataType": "string"}], "measures": []}],
+        relationships=[{"from": "Sales.custkey", "to": "Customer.custkey", "type": "manyToOne"}],
+        translated_measures=[{"name": "T", "translated_sql": "SUM(source.amt)"}],
+        source_schema="raw", dim_schema="sem", dim_tables={"Customer"},
+    )
+    assert spec.source == "cat.raw.sales"                 # fact from source_schema
+    cust = next(j for j in spec.joins if j.name == "customer")
+    assert cust.source == "cat.sem.customer"              # dim join from dim_schema
+
+
 def test_join_direct_fact_edge_wins_over_indirect():
     """wo0.10: a dimension related to several facts must join rooted at the
     CURRENT fact (direct edge), not an earlier indirect relationship."""

@@ -379,6 +379,39 @@ function DependencyGraph({ measures, onPick }) {
   );
 }
 
+// Tables with no DAX measures aren't converted to metric views — they're
+// pass-through Delta tables (dimensions/lookups). Surface them so the migration
+// accounts for every table, not just the fact groups.
+function PassthroughTables({ tables, defaultOpen = false }) {
+  const [open, setOpen] = useState(defaultOpen);
+  if (!tables || tables.length === 0) return null;
+  return (
+    <div className="glass" style={{ padding: 16 }}>
+      <div onClick={() => setOpen(!open)} style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }}>
+        <span style={{ fontSize: 15, fontWeight: 700 }}>📦 Pass-through tables (no DAX → Delta)</span>
+        <span className="tag tag-info">{tables.length}</span>
+        <span style={{ marginLeft: 'auto', color: '#64748b', fontSize: 12 }}>{open ? '▲' : '▼'}</span>
+      </div>
+      <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 6 }}>
+        These tables have no measures, so there's no DAX to convert — no metric view is generated.
+        They're carried over as plain <b>Delta tables</b> (dimensions / lookups) and joined into the fact views.
+      </div>
+      {open && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(220px,1fr))', gap: 8, marginTop: 12 }}>
+          {tables.map((t, i) => (
+            <div key={i} className="glass" style={{ padding: '8px 12px', borderLeft: '3px solid #38bdf8' }}>
+              <div style={{ fontSize: 12, fontWeight: 600 }}>{t.display_name || t.name}</div>
+              <div style={{ fontSize: 10, color: '#64748b', marginTop: 2 }}>
+                {t.name}{typeof t.columns === 'number' ? ` · ${t.columns} cols` : ''}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ResultsExplorer({ groups, totals }) {
   const [openGroup, setOpenGroup] = useState(null);
   const [openMeasure, setOpenMeasure] = useState(null);
@@ -634,6 +667,9 @@ export default function App() {
   const [deployStatus, setDeployStatus] = useState('idle');
   const [deployLog, setDeployLog] = useState([]);
   const [rollbackTarget, setRollbackTarget] = useState('');
+  const [refreshingSQL, setRefreshingSQL] = useState(false);
+  const [downloadingZip, setDownloadingZip] = useState(false);
+  const [downloadingSQL, setDownloadingSQL] = useState(false);
 
   // Connect state
   const [pbiAuth, setPbiAuth] = useState({ tenant_id: '', client_id: '', client_secret: '' });
@@ -656,6 +692,7 @@ export default function App() {
 
   // TMDL upload
   const [tmdlFile, setTmdlFile] = useState(null);
+  const [runName, setRunName] = useState('');  // user label for this run (history)
   const [tmdlLoading, setTmdlLoading] = useState(false);
   const [tmdlError, setTmdlError] = useState('');
   const [tmdlDragOver, setTmdlDragOver] = useState(false);
@@ -750,6 +787,8 @@ export default function App() {
   // TMDL Upload
   const uploadTMDL = async (file) => {
     setTmdlLoading(true); setTmdlError('');
+    // Prefill the run name from the filename stem if the user hasn't typed one.
+    setRunName(prev => prev || (file?.name || '').replace(/\.(zip|pbix|tmdl)$/i, ''));
     try {
       const fd = new FormData();
       fd.append('file', file);
@@ -770,6 +809,7 @@ export default function App() {
     try {
       const payload = {
         model,
+        run_name: (runName || '').trim() || model.name || '',
         catalog: dbxConfig.catalog,
         schema: dbxConfig.schema,
         warehouse_id: dbxConfig.warehouse_id,
@@ -861,6 +901,96 @@ export default function App() {
     } catch (e) { addDeployLog(`Rollback failed: ${e.message}`, 'error'); }
   };
 
+  // Regenerate the DDL preview against the currently-entered Catalog/Schema
+  // (does not deploy or create a new history record).
+  const regenerateSQL = async () => {
+    if (!selectedModel) { addDeployLog('Run a migration first to generate SQL DDL.', 'warning'); return; }
+    setRefreshingSQL(true);
+    try {
+      const data = await apiFetch('/api/generate-ddl', {
+        method: 'POST',
+        body: JSON.stringify({
+          model: selectedModel,
+          catalog: dbxConfig.catalog,
+          schema: dbxConfig.schema,
+          convert_nested_windows: convertNestedWindows,
+        }),
+      });
+      setGeneratedSQL(Object.values(data.generated_sql || {}).join('\n\n'));
+      addDeployLog(`SQL refreshed for ${data.catalog}.${data.schema}`, 'success');
+    } catch (e) {
+      addDeployLog(`Refresh failed: ${e.message}`, 'error');
+    } finally { setRefreshingSQL(false); }
+  };
+
+  // Download every generated Metric View DDL as a single ZIP (one .sql per view),
+  // regenerated against the current Catalog/Schema so it matches the preview.
+  const downloadSQLZip = async () => {
+    if (!selectedModel) { addDeployLog('Run a migration first to generate SQL DDL.', 'warning'); return; }
+    setDownloadingZip(true);
+    try {
+      const res = await fetch('/api/export/zip', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: selectedModel,
+          catalog: dbxConfig.catalog,
+          schema: dbxConfig.schema,
+          convert_nested_windows: convertNestedWindows,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }));
+        throw new Error(err.error || err.message || res.statusText);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'metric_view_sqls.zip';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      addDeployLog('Downloaded metric_view_sqls.zip', 'success');
+    } catch (e) {
+      addDeployLog(`Download failed: ${e.message}`, 'error');
+    } finally { setDownloadingZip(false); }
+  };
+
+  const downloadSQLFile = async () => {
+    if (!selectedModel) { addDeployLog('Run a migration first to generate SQL DDL.', 'warning'); return; }
+    setDownloadingSQL(true);
+    try {
+      const res = await fetch('/api/export/sql', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: selectedModel,
+          catalog: dbxConfig.catalog,
+          schema: dbxConfig.schema,
+          convert_nested_windows: convertNestedWindows,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }));
+        throw new Error(err.error || err.message || res.statusText);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'metric_views.sql';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      addDeployLog('Downloaded metric_views.sql (ordered by dependencies)', 'success');
+    } catch (e) {
+      addDeployLog(`Download failed: ${e.message}`, 'error');
+    } finally { setDownloadingSQL(false); }
+  };
+
   const navItems = [
     { id: 'connect', icon: '⚡', label: 'Connect' },
     { id: 'explore', icon: '🔍', label: 'Explore' },
@@ -876,6 +1006,15 @@ export default function App() {
   );
   const validationResult = migrationReport?.validation_result || {};
   const validationIssues = validationResult.issues || [];
+  // Tables not converted to a metric view (no DAX measures). Prefer the report's
+  // list; fall back to deriving it from the loaded model (older runs).
+  const passthroughTables = (migrationReport?.passthrough_tables?.length
+    ? migrationReport.passthrough_tables
+    : (selectedModel?.tables || []).filter(t => !((t.measures || []).length)).map(t => ({
+        name: String(t.name || '').toLowerCase().replace(/\s+/g, '_'),
+        display_name: t.name, columns: (t.columns || []).length,
+        note: 'No DAX found — pass-through Delta table (no metric view needed)',
+      })));
 
   return (
     <div style={{ display: 'flex', height: '100vh', fontFamily: '-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif', background: 'linear-gradient(135deg,#0f0f23 0%,#1a1a3e 50%,#0d1117 100%)', color: '#e2e8f0', overflow: 'hidden' }}>
@@ -1014,6 +1153,12 @@ export default function App() {
                         )}
                       </div>
                       {tmdlError && <div className="tag tag-error" style={{ marginTop: 12 }}>{tmdlError}</div>}
+                      <div style={{ marginTop: 16 }}>
+                        <label style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4, display: 'block' }}>Migration name</label>
+                        <input className="input" value={runName} onChange={e => setRunName(e.target.value)}
+                          placeholder={tmdlFile ? tmdlFile.name.replace(/\.(zip|pbix|tmdl)$/i, '') : 'e.g. Q3 Sales model'} />
+                        <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>Names this run in History so past uploads are easy to find. Defaults to the file name.</div>
+                      </div>
                       <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 16, fontSize: 13, color: '#94a3b8', cursor: 'pointer' }}>
                         <input type="checkbox" style={{ marginTop: 2 }} checked={convertNestedWindows} onChange={e => setConvertNestedWindows(e.target.checked)} />
                         <span>
@@ -1070,6 +1215,36 @@ export default function App() {
                       <span className="tag tag-info">{(selectedModel.tables || []).length} tables</span>
                       <motion.button className="btn-primary" style={{ marginLeft: 'auto', fontSize: 13 }} whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}
                         onClick={() => { setPage('migrate'); runMigration(selectedModel); }}>🔄 Migrate This Model</motion.button>
+                    </div>
+
+                    {/* Key metrics summary — headline counts derived from the loaded model. */}
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 12 }}>
+                      {[
+                        {
+                          label: 'Translated as metrics',
+                          value: (selectedModel.tables || []).reduce((n, t) => n + ((t.measures || []).length), 0),
+                          hint: 'DAX measures → Metric View measures',
+                          color: '#4ade80',
+                        },
+                        {
+                          label: 'Table DDL (no DAX)',
+                          value: (selectedModel.tables || []).filter(t => !((t.measures || []).length)).length,
+                          hint: 'Dimension/lookup tables emitted as plain table DDL',
+                          color: '#a78bfa',
+                        },
+                        {
+                          label: 'Perspectives identified',
+                          value: (selectedModel.perspectives || []).length,
+                          hint: 'Named subsets of the semantic model',
+                          color: '#6366f1',
+                        },
+                      ].map((c, i) => (
+                        <div key={i} className="glass" style={{ padding: 16 }}>
+                          <div style={{ fontSize: 11, color: '#94a3b8' }}>{c.label}</div>
+                          <div style={{ fontSize: 28, fontWeight: 700, color: c.color, marginTop: 4 }}>{String(c.value)}</div>
+                          <div style={{ fontSize: 10, color: '#64748b', marginTop: 4 }}>{c.hint}</div>
+                        </div>
+                      ))}
                     </div>
 
                     {(selectedModel.tables || []).map((table, ti) => (
@@ -1226,8 +1401,9 @@ export default function App() {
                         </motion.div>
                       )}
                       {activeTab === 'results' && migrationReport && (
-                        <motion.div key="results" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                        <motion.div key="results" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
                           <ResultsExplorer groups={factGroups} totals={pipelineSummary} />
+                          <PassthroughTables tables={passthroughTables} />
                         </motion.div>
                       )}
                       {activeTab === 'report' && migrationReport && (
@@ -1259,6 +1435,7 @@ export default function App() {
                               ))}
                             </div>
                           </div>
+                          <PassthroughTables tables={passthroughTables} defaultOpen />
                           <div className="glass" style={{ padding: 16, display: 'flex', gap: 12 }}>
                             <span className={`tag ${(validationResult.errors || 0) > 0 ? 'tag-error' : 'tag-success'}`}>{validationResult.errors || 0} validation errors</span>
                             <span className={`tag ${(validationResult.warnings || 0) > 0 ? 'tag-warning' : 'tag-success'}`}>{validationResult.warnings || 0} warnings</span>
@@ -1294,7 +1471,15 @@ export default function App() {
                     <div><label style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4, display: 'block' }}>Warehouse ID</label><input className="input" value={dbxConfig.warehouse_id} onChange={e => setDbxConfig(c => ({ ...c, warehouse_id: e.target.value }))} /></div>
                   </div>
 
-                  {!generatedSQL && <div style={{ fontSize: 13, color: '#94a3b8', marginBottom: 12 }}>Run a migration first to generate SQL DDL.</div>}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, gap: 12, flexWrap: 'wrap' }}>
+                    <div style={{ fontSize: 12, color: '#94a3b8' }}>
+                      {selectedModel ? 'Regenerate the DDL after changing Catalog or Schema.' : 'Run a migration first to generate SQL DDL.'}
+                    </div>
+                    <motion.button className="btn-secondary" disabled={!selectedModel || refreshingSQL} whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }} onClick={regenerateSQL}>
+                      {refreshingSQL ? '⏳ Refreshing...' : '🔄 Refresh SQL'}
+                    </motion.button>
+                  </div>
+
                   {generatedSQL && <div className="code-block" style={{ fontSize: 11, maxHeight: 180, marginBottom: 16 }}>{generatedSQL}</div>}
 
                   <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
@@ -1305,6 +1490,12 @@ export default function App() {
                       <motion.button className="btn-secondary" whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }} onClick={rollback}>↩ Rollback {rollbackTarget}</motion.button>
                     )}
                     {generatedSQL && <button className="btn-secondary" onClick={() => navigator.clipboard?.writeText(generatedSQL)}>📋 Copy DDL</button>}
+                    <motion.button className="btn-secondary" disabled={!selectedModel || downloadingSQL} whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }} onClick={downloadSQLFile}>
+                      {downloadingSQL ? '⏳ Generating...' : '📄 Download SQL (.sql, ordered)'}
+                    </motion.button>
+                    <motion.button className="btn-secondary" disabled={!selectedModel || downloadingZip} whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }} onClick={downloadSQLZip}>
+                      {downloadingZip ? '⏳ Zipping...' : '📦 Download SQLs (.zip)'}
+                    </motion.button>
                   </div>
                 </motion.div>
 
@@ -1362,7 +1553,9 @@ export default function App() {
                           variants={cardVariants} custom={i} initial="initial" animate="animate" whileHover="hover"
                           onClick={() => openMigration(h.migration_id)}>
                           <div>
-                            <div style={{ fontWeight: 600, fontSize: 14 }}>{h.model_name || 'Untitled model'}</div>
+                            <div style={{ fontWeight: 600, fontSize: 14 }}>{h.run_name || h.model_name || 'Untitled model'}</div>
+                            {h.run_name && h.model_name && h.run_name !== h.model_name &&
+                              <div style={{ fontSize: 11, color: '#94a3b8' }}>{h.model_name}</div>}
                             <div style={{ fontSize: 10, color: '#64748b' }}>{h.migration_id}</div>
                           </div>
                           <div style={{ fontSize: 12, color: '#94a3b8' }}>

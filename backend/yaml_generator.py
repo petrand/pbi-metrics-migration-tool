@@ -88,6 +88,33 @@ def _sanitize_name(name: str) -> str:
     return s
 
 
+# Power BI / TMDL data types -> Databricks SQL types. Used to emit CREATE TABLE
+# IF NOT EXISTS for the physical tables the generated metric views read from.
+# Unknown or missing types fall back to STRING (a safe, always-castable default).
+_TMDL_TO_SQL_TYPE = {
+    "int64": "BIGINT",
+    "int": "INT",
+    "integer": "INT",
+    "double": "DOUBLE",
+    "decimal": "DECIMAL(38, 18)",
+    "currency": "DECIMAL(38, 18)",
+    "string": "STRING",
+    "text": "STRING",
+    "boolean": "BOOLEAN",
+    "bool": "BOOLEAN",
+    "datetime": "TIMESTAMP",
+    "timestamp": "TIMESTAMP",
+    "date": "DATE",
+    "time": "STRING",
+    "binary": "BINARY",
+}
+
+
+def _map_sql_type(dtype: Optional[str]) -> str:
+    """Map a TMDL/Power BI column data type to a Databricks SQL type."""
+    return _TMDL_TO_SQL_TYPE.get((dtype or "").strip().lower(), "STRING")
+
+
 def _escape_yaml_string(s: str) -> str:
     """Escape a string for safe YAML embedding."""
     if not s:
@@ -153,6 +180,47 @@ def _has_aggregation(expr: str) -> bool:
     (Power BI implicit aggregation) is not valid and must be excluded.
     """
     return bool(expr) and bool(_AGG_FUNCS.search(expr))
+
+
+def _filter_contains_aggregate(expr: str) -> bool:
+    """True if a generated ``FILTER (WHERE ...)`` clause contains an aggregate.
+
+    Databricks rejects an aggregate inside an aggregate's FILTER
+    (INVALID_AGGREGATE_FILTER.CONTAINS_AGGREGATE), e.g. a DAX measure like
+    ``CALCULATE(COUNTROWS(t), FILTER(t, t[k] <= MAX('Cal'[Key])))`` translates to
+    ``COUNT(*) FILTER (WHERE source.k <= max(cal.key))`` — valid-looking but
+    un-deployable. Such a measure has no metric-view filtered-measure equivalent
+    and must be excluded rather than break the whole view's deploy. Scans each
+    ``FILTER (...)`` group's balanced parens (nested groups included).
+    """
+    if not expr or "filter" not in expr.lower():
+        return False
+    lower = expr.lower()
+    idx = 0
+    while True:
+        pos = lower.find("filter", idx)
+        if pos < 0:
+            return False
+        p = pos + len("filter")
+        while p < len(expr) and expr[p] in " \t":
+            p += 1
+        if p >= len(expr) or expr[p] != "(":
+            idx = pos + 1
+            continue
+        depth, end = 0, -1
+        for j in range(p, len(expr)):
+            if expr[j] == "(":
+                depth += 1
+            elif expr[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end < 0:
+            return False
+        if _AGG_FUNCS.search(expr[p:end + 1]):
+            return True
+        idx = end + 1
 
 
 def _yaml_scalar(s) -> str:
@@ -226,6 +294,8 @@ class MetricViewYAMLGenerator:
         convert_nested_windows: bool = True,
         known_columns: dict = None,
         source_schema: str = None,
+        dim_tables: set = None,
+        dim_schema: str = None,
     ) -> MetricViewSpec:
         """Build a MetricViewSpec from semantic model components.
 
@@ -246,6 +316,10 @@ class MetricViewYAMLGenerator:
         # Source tables may live in a different schema than the views (a raw vs
         # semantic split). `source_schema` defaults to `schema` (co-located).
         src_schema = source_schema or schema
+        # Dimension (no-DAX) tables may live in a different schema than the fact
+        # source tables (e.g. dims in the semantic schema, facts in a raw one).
+        dim_set = {_sanitize_name(t) for t in (dim_tables or [])}
+        dim_sch = dim_schema or src_schema
         fact_table_lower = _sanitize_name(fact_table)
         source_fqn = f"{catalog}.{src_schema}.{fact_table_lower}"
         view_name = f"{catalog}.{schema}.{fact_table_lower}_metric_view"
@@ -258,7 +332,8 @@ class MetricViewYAMLGenerator:
 
         # ── Build joins (with cardinality/rely + snowflake nesting) ──
         join_nodes, alias_path = self._build_joins(
-            fact_table_lower, relationships, catalog, src_schema, overrides
+            fact_table_lower, relationships, catalog, src_schema, overrides,
+            dim_tables=dim_set, dim_schema=dim_sch
         )
         # Attach nested joins to their parents (snowflake schemas).
         for node in join_nodes.values():
@@ -332,6 +407,16 @@ class MetricViewYAMLGenerator:
             # manual measure_override.
             if _has_residual_dax(expr):
                 excluded[tm["name"]] = "residual DAX with no clean SQL/window equivalent"
+                continue
+            # A FILTER (WHERE ...) predicate that itself contains an aggregate
+            # (e.g. `... <= max(calendar.key)` from a point-in-time/SCD DAX
+            # measure) is rejected by Databricks (INVALID_AGGREGATE_FILTER) and
+            # would fail the whole view's deploy — exclude it for manual review.
+            if _filter_contains_aggregate(expr):
+                excluded[tm["name"]] = (
+                    "aggregate inside FILTER (WHERE ...) — no valid metric-view "
+                    "filtered-measure equivalent (point-in-time/SCD pattern)"
+                )
                 continue
             # A metric-view measure must aggregate. Power BI implicitly
             # aggregates a bare column measure; here a measure with neither an
@@ -746,7 +831,8 @@ class MetricViewYAMLGenerator:
                 changed = True
         return kept, dropped
 
-    def _build_joins(self, fact_lower, relationships, catalog, schema, overrides):
+    def _build_joins(self, fact_lower, relationships, catalog, schema, overrides,
+                     dim_tables=None, dim_schema=None):
         """Build join nodes keyed by sanitized alias, resolving snowflake nesting.
 
         Returns (nodes, alias_path) where:
@@ -784,7 +870,10 @@ class MetricViewYAMLGenerator:
             to_col = _sanitize_name(to_parts[1])
 
             # Resolve the join source table, applying table-name overrides.
-            join_source = f"{catalog}.{schema}.{to_table_lower}"
+            # Dimension (no-DAX) targets may live in a different schema than fact
+            # source tables.
+            tbl_schema = dim_schema if (dim_tables and to_table_lower in dim_tables and dim_schema) else schema
+            join_source = f"{catalog}.{tbl_schema}.{to_table_lower}"
             if overrides is not None:
                 mapped = self._map_table(overrides, to_parts[0])
                 if mapped and mapped != to_table_lower:
@@ -1060,6 +1149,8 @@ class MetricViewYAMLGenerator:
         convert_nested_windows: bool = True,
         known_columns: dict = None,
         source_schema: str = None,
+        dim_tables: set = None,
+        dim_schema: str = None,
     ) -> list:
         """Generate metric view specs for all fact groups in a model.
 
@@ -1112,6 +1203,8 @@ class MetricViewYAMLGenerator:
                 convert_nested_windows=convert_nested_windows,
                 known_columns=known_columns,
                 source_schema=source_schema,
+                dim_tables=dim_tables,
+                dim_schema=dim_schema,
             )
             # A Metric View must define at least one measure or dimension.
             # After excluding residual/window measures a fact group can end up
@@ -1130,4 +1223,136 @@ class MetricViewYAMLGenerator:
             ddl_str = self.generate_ddl(spec)
             results.append((spec, yaml_str, ddl_str))
 
-        return results
+        # Emit in dependency order: if one generated view references another
+        # generated view (as its `source`, a join source, or anywhere in its
+        # DDL — i.e. metric-view-on-metric-view composition), the referenced
+        # view must be created first. Independent views keep their original
+        # (fact-table) order; cycles fall back to stable order with a warning.
+        # Returns views only, topologically ordered among themselves. The
+        # `CREATE TABLE IF NOT EXISTS` DDL for the physical tables these views
+        # read from is built separately via `build_table_entries` and prepended
+        # by the pipeline, so tables land ahead of the views they depend on.
+        return self._topo_order_results(results)
+
+    def build_table_entries(self, results: list, tables: list) -> list:
+        """Build `(spec, "", ddl)` entries with `CREATE TABLE IF NOT EXISTS` DDL
+        for every physical table referenced by the generated views. Tables are
+        collected in first-referenced order (source before joins), deduped, and
+        mapped back to the parsed model for their columns/types. A referenced
+        table absent from the model (or with no columns) is skipped with a warning.
+
+        Column identifiers are normalized exactly like the metric-view generator
+        normalizes `source.<col>` references (``_sanitize_name`` + ``_quote_ident``)
+        so the emitted columns line up with what the views select. The entries use
+        an empty YAML string so the pipeline records only their SQL (no metric-view
+        YAML, measures, or dimensions)."""
+        def _join_sources(joins: list) -> list:
+            out = []
+            for j in joins or []:
+                if getattr(j, "source", ""):
+                    out.append(j.source)
+                out.extend(_join_sources(getattr(j, "joins", []) or []))
+            return out
+
+        # Ordered, unique FQNs referenced by the views (source first, then joins).
+        fqns: list = []
+        seen: set = set()
+        for spec, _y, _d in results:
+            for fqn in [spec.source, *_join_sources(spec.joins)]:
+                if fqn and fqn not in seen:
+                    seen.add(fqn)
+                    fqns.append(fqn)
+
+        # sanitized table name -> model table (first definition wins).
+        by_name: dict = {}
+        for t in tables:
+            by_name.setdefault(_sanitize_name(t.get("name", "")), t)
+
+        entries: list = []
+        for fqn in fqns:
+            key = fqn.split(".")[-1]
+            t = by_name.get(key)
+            if t is None:
+                logger.warning(
+                    "Referenced table %s is not in the model — skipping its CREATE TABLE.",
+                    fqn,
+                )
+                continue
+            col_defs = []
+            used_cols: set = set()
+            for col in t.get("columns", []):
+                cname = _sanitize_name(col.get("name", ""))
+                if not cname or cname in used_cols:
+                    continue
+                used_cols.add(cname)
+                ctype = _map_sql_type(col.get("dataType") or col.get("data_type"))
+                col_defs.append(f"  {_quote_ident(cname)} {ctype}")
+            if not col_defs:
+                logger.warning(
+                    "Table %s has no usable columns — skipping its CREATE TABLE.", fqn
+                )
+                continue
+            ddl = (
+                f"CREATE OR REPLACE TABLE {fqn} (\n"
+                + ",\n".join(col_defs)
+                + "\n);"
+            )
+            tspec = MetricViewSpec(source="", view_name=fqn, comment="")
+            entries.append((tspec, "", ddl))
+        return entries
+
+    @staticmethod
+    def _topo_order_results(results: list) -> list:
+        """Order (spec, yaml, ddl) tuples so each generated view is emitted after
+        the generated views it references. Dependencies are detected when a
+        view's `source`, a (possibly nested) join `source`, or its DDL text
+        names another generated view's fully-qualified `view_name`. Stable for
+        independent views; cycle-tolerant (falls back to original order)."""
+        def _join_sources(joins: list) -> list:
+            srcs = []
+            for j in joins or []:
+                if getattr(j, "source", ""):
+                    srcs.append(j.source)
+                srcs.extend(_join_sources(getattr(j, "joins", []) or []))
+            return srcs
+
+        # Map each produced view_name (lowercased) -> its result index.
+        produced = {}
+        for idx, (spec, _yaml, _ddl) in enumerate(results):
+            vn = (spec.view_name or "").lower()
+            if vn:
+                produced[vn] = idx
+
+        # For each result, the set of OTHER results it depends on (by index).
+        deps: list = []
+        for spec, _yaml, ddl in results:
+            refs = {(spec.source or "").lower()}
+            refs.update(s.lower() for s in _join_sources(spec.joins))
+            ddl_lower = (ddl or "").lower()
+            dep_idxs = set()
+            for vn, pidx in produced.items():
+                own = (spec.view_name or "").lower()
+                if vn == own:
+                    continue  # never depend on self
+                # A dependency exists if this view sources/joins that view, or
+                # otherwise references it by fully-qualified name in its DDL.
+                if vn in refs or re.search(rf'(?<![\w.]){re.escape(vn)}(?![\w])', ddl_lower):
+                    dep_idxs.add(pidx)
+            deps.append(dep_idxs)
+
+        ordered: list = []
+        placed: set = set()
+
+        def visit(i, stack):
+            if i in placed:
+                return
+            for d in sorted(deps[i]):
+                if d not in placed and d not in stack:
+                    visit(d, stack | {i})
+            if i not in placed:
+                ordered.append(results[i])
+                placed.add(i)
+
+        for i in range(len(results)):
+            visit(i, set())
+        return ordered

@@ -5,18 +5,21 @@ Production API server connecting Power BI extraction, DAX translation,
 YAML generation, validation, evaluation, and Databricks deployment.
 """
 
+import io
 import json
 import logging
 import os
+import re
 import tempfile
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend import migration_store
@@ -347,6 +350,9 @@ def run_migration(body: dict = {}):
     # fail the request; the run already succeeded in memory.
     record = result.to_dict()
     record["created_at"] = result.started_at or datetime.now(timezone.utc).isoformat()
+    # User-supplied label for this run so history is identifiable by name;
+    # fall back to the model name when no name was entered.
+    record["run_name"] = (body.get("run_name") or "").strip() or model.get("name", "")
     record["catalog"] = config.catalog
     record["schema"] = config.schema
     record["tables"] = len(model.get("tables", []))
@@ -355,6 +361,122 @@ def run_migration(body: dict = {}):
     migration_store.save(result.migration_id, record)
 
     return result.to_dict()
+
+
+def _regenerate_sql(body: dict) -> dict:
+    """Regenerate Metric View DDL against the given catalog/schema WITHOUT
+    deploying or persisting a history record. Used by the Deploy card's
+    "Refresh SQL" and "Download SQLs (.zip)" actions so the previewed/exported
+    DDL always matches the currently-entered catalog and schema."""
+    model = body.get("model") or _state.get("current_model")
+    if not model:
+        raise HTTPException(400, "No model loaded. Upload a TMDL export or extract from Power BI first.")
+
+    config = MigrationConfig(
+        catalog=body.get("catalog", "main"),
+        schema=body.get("schema", "default"),
+        deploy=False,
+        # dry_run short-circuits before generation; validate_only runs translate
+        # + generate + validate then returns before evaluate/deploy — exactly the
+        # SQL we want to preview/export, with no deployment side effects.
+        dry_run=False,
+        validate_only=True,
+        convert_nested_windows=body.get("convert_nested_windows", True),
+    )
+    if body.get("overrides"):
+        mgr = OverridesManager()
+        config.overrides = mgr.load_from_dict(body["overrides"])
+
+    result = MigrationPipeline().run(model, config, None)
+    return {
+        "generated_sql": result.generated_sql,
+        "generated_yaml": result.generated_yaml,
+        "catalog": config.catalog,
+        "schema": config.schema,
+    }
+
+
+_VIEW_NAME_RE = re.compile(
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:VIEW|TABLE)\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)",
+    re.IGNORECASE,
+)
+
+
+def _sql_filename(group_name: str, ddl: str) -> str:
+    """Pick a stable, filesystem-safe .sql name for a generated object. Prefer the
+    fully-qualified view/table name from the DDL; fall back to the group key."""
+    match = _VIEW_NAME_RE.search(ddl or "")
+    base = match.group(1).strip().strip("`").split(".")[-1] if match else group_name
+    base = re.sub(r"[^\w.-]+", "_", base).strip("_") or "metric_view"
+    return f"{base}.sql"
+
+
+@app.post("/api/generate-ddl")
+def generate_ddl(body: dict = {}):
+    """Regenerate the Metric View DDL preview for the current catalog/schema."""
+    return _regenerate_sql(body)
+
+
+@app.post("/api/export/zip")
+def export_zip(body: dict = {}):
+    """Bundle every generated Metric View DDL into a single downloadable ZIP,
+    one <view_name>.sql file per view, regenerated against the current
+    catalog/schema."""
+    generated = _regenerate_sql(body)["generated_sql"]
+    if not generated:
+        raise HTTPException(400, "No Metric View SQL was generated for this model.")
+
+    buf = io.BytesIO()
+    used: dict = {}
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for group_name, ddl in generated.items():
+            name = _sql_filename(group_name, ddl)
+            # De-dupe identical filenames across fact groups.
+            if name in used:
+                used[name] += 1
+                stem, ext = name.rsplit(".", 1)
+                name = f"{stem}_{used[name]}.{ext}"
+            else:
+                used[name] = 0
+            zf.writestr(name, ddl or "")
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="metric_view_sqls.zip"'},
+    )
+
+
+@app.post("/api/export/sql")
+def export_sql(body: dict = {}):
+    """Emit every generated Metric View DDL as ONE combined .sql file, ordered by
+    dependencies: objects with no dependencies first, dependent views after. The
+    order comes straight from `generated_sql`, which the generator topologically
+    sorts (a view referenced by another is emitted before its dependents)."""
+    generated = _regenerate_sql(body)["generated_sql"]
+    if not generated:
+        raise HTTPException(400, "No Metric View SQL was generated for this model.")
+
+    parts = [
+        "-- Metric View DDL — generated in dependency order",
+        "-- (independent objects first, dependent views after).",
+        "",
+    ]
+    for group_name, ddl in generated.items():
+        view_name = _sql_filename(group_name, ddl).rsplit(".", 1)[0]
+        parts.append(f"-- ── {view_name} ─────────────────────────────────────────")
+        parts.append((ddl or "").rstrip())
+        # Metric-view DDL uses `AS $$ … $$`, so a trailing `;` is not required;
+        # a blank line keeps statements readable when opened as one script.
+        parts.append("")
+    combined = "\n".join(parts).rstrip() + "\n"
+
+    return StreamingResponse(
+        io.BytesIO(combined.encode("utf-8")),
+        media_type="application/sql",
+        headers={"Content-Disposition": 'attachment; filename="metric_views.sql"'},
+    )
 
 
 @app.get("/api/migrate/{migration_id}/status")

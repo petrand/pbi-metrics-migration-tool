@@ -76,6 +76,9 @@ class MigrationResult:
     dashboard_spec: Optional[dict] = None
     rls_notes: List[str] = field(default_factory=list)
     rls_scaffolding: str = ""
+    # Tables with no measures (no DAX) — not converted to a metric view; they are
+    # pass-through Delta tables (dimensions / lookups). Each: {name, columns, note}.
+    passthrough_tables: List[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -99,6 +102,7 @@ class MigrationResult:
             "dashboard_url": self.dashboard_url,
             "rls_notes": self.rls_notes,
             "rls_scaffolding": self.rls_scaffolding,
+            "passthrough_tables": self.passthrough_tables,
         }
 
 
@@ -211,6 +215,18 @@ class MigrationPipeline:
             m["name"] for t in model.get("tables", []) if t.get("name", "") in security_tables
             for m in t.get("measures", [])
         }
+        # Tables with no measures carry no DAX to convert — they are not turned
+        # into a metric view. They are pass-through Delta tables (dimensions /
+        # lookups) consumed as-is (and joined into the fact views).
+        result.passthrough_tables = [
+            {
+                "name": _sanitize_name(t.get("name", "")),
+                "display_name": t.get("name", ""),
+                "columns": len(t.get("columns", []) or []),
+                "note": "No DAX found — pass-through Delta table (no metric view needed)",
+            }
+            for t in model.get("tables", []) if not t.get("measures")
+        ]
         try:
             fact_tables = [t for t in filtered_tables if t.get("measures")]
             for fact in fact_tables:
@@ -249,6 +265,12 @@ class MigrationPipeline:
                 schema=config.schema,
                 convert_nested_windows=config.convert_nested_windows,
             )
+            # The generated metric views read from physical tables that must
+            # exist first. Prepend `CREATE TABLE IF NOT EXISTS` DDL for every
+            # table a view references (source + joins), so `generated_sql` is
+            # dependency-ordered: tables first, then the views that depend on them.
+            table_entries = self.yaml_gen.build_table_entries(gen_results, filtered_tables)
+            gen_results = table_entries + gen_results
             # Keyed by sanitized source table so the evaluate step can attach
             # per-view info: excluded measures + converted dimension columns.
             excluded_by_source = {}
@@ -256,8 +278,13 @@ class MigrationPipeline:
             deployed_by_source = {}
             for spec, yaml_str, ddl_str in gen_results:
                 group_name = spec.view_name.split(".")[-1] if spec.view_name else "default"
-                result.generated_yaml[group_name] = yaml_str
                 result.generated_sql[group_name] = ddl_str
+                # Dependency table entries (CREATE TABLE the views read from) carry
+                # SQL but no metric-view YAML — record their DDL (kept ahead of the
+                # views in insertion order) and skip the metric-view bookkeeping.
+                if not yaml_str:
+                    continue
+                result.generated_yaml[group_name] = yaml_str
                 src_key = spec.source.split(".")[-1] if spec.source else group_name
                 excluded_by_source[src_key] = dict(getattr(spec, "excluded_measures", {}) or {})
                 dims_by_source[src_key] = [

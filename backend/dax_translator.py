@@ -782,6 +782,25 @@ class DAXTranslator:
             sql, flags=re.IGNORECASE
         )
 
+        # COUNTROWS(VALUES(Table[Col])) -> COUNT(DISTINCT col). This is the
+        # canonical DAX distinct-count idiom (equivalent to DISTINCTCOUNT). Must
+        # run BEFORE the bare COUNTROWS(Table) rule. Only the COUNTROWS(VALUES(col))
+        # wrapper is rewritten — a bare VALUES(col) or FILTER(VALUES(col), ...)
+        # iterator is left as residual DAX for manual review, since a table-valued
+        # distinct set has no scalar SQL equivalent inside a metric-view measure.
+        sql, _n_tv = re.subn(
+            r"\bCOUNTROWS\s*\(\s*VALUES\s*\(\s*'?(\w[\w\s]*?)'?\[(\w[\w\s]*?)\]\s*\)\s*\)",
+            lambda m: f"COUNT(DISTINCT source.{m.group(2).lower().replace(' ', '_')})",
+            sql, flags=re.IGNORECASE,
+        )
+        sql, _n_bc = re.subn(
+            r"\bCOUNTROWS\s*\(\s*VALUES\s*\(\s*\[(\w[\w\s]*?)\]\s*\)\s*\)",
+            lambda m: f"COUNT(DISTINCT source.{m.group(1).lower().replace(' ', '_')})",
+            sql, flags=re.IGNORECASE,
+        )
+        if _n_tv or _n_bc:
+            self._transformations.append("COUNTROWS_VALUES_to_COUNT_DISTINCT")
+
         # COUNTROWS(Table)
         sql = re.sub(
             r'\bCOUNTROWS\s*\(\s*\'?(\w[\w\s]*?)\'?\s*\)',
