@@ -27,6 +27,13 @@ INLINE_MODEL = {
     "relationships": [],
 }
 
+# Generic target catalog/schema for DDL-generation tests. Kept as constants so
+# assertions check the entered values are honoured, without hardcoding any
+# particular deployment's names.
+TEST_CATALOG = "analytics"
+TEST_SCHEMA = "gold"
+TEST_FQN = f"{TEST_CATALOG}.{TEST_SCHEMA}"
+
 
 # ── Health & Ready ────────────────────────────────────────────────────────────
 
@@ -267,15 +274,15 @@ def test_generate_ddl_returns_sql_for_current_catalog_schema():
     before = len(client.get("/api/migrations").json()["migrations"])
     response = client.post("/api/generate-ddl", json={
         "model": INLINE_MODEL,
-        "catalog": "ssas_pbi_mv_migration_catalog",
-        "schema": "test_ssas",
+        "catalog": TEST_CATALOG,
+        "schema": TEST_SCHEMA,
     })
     assert response.status_code == 200
     body = response.json()
-    assert body["catalog"] == "ssas_pbi_mv_migration_catalog"
-    assert body["schema"] == "test_ssas"
+    assert body["catalog"] == TEST_CATALOG
+    assert body["schema"] == TEST_SCHEMA
     ddl = "\n".join(body["generated_sql"].values())
-    assert "ssas_pbi_mv_migration_catalog.test_ssas" in ddl
+    assert TEST_FQN in ddl
     # No new history record was written by a preview refresh.
     after = len(client.get("/api/migrations").json()["migrations"])
     assert after == before
@@ -295,8 +302,8 @@ def test_export_zip_returns_zip_with_sql_entries():
 
     response = client.post("/api/export/zip", json={
         "model": INLINE_MODEL,
-        "catalog": "ssas_pbi_mv_migration_catalog",
-        "schema": "test_ssas",
+        "catalog": TEST_CATALOG,
+        "schema": TEST_SCHEMA,
     })
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/zip"
@@ -307,7 +314,7 @@ def test_export_zip_returns_zip_with_sql_entries():
     assert all(n.endswith(".sql") for n in names)
     # The bundled DDL is regenerated against the requested catalog/schema.
     combined = "\n".join(zf.read(n).decode() for n in names)
-    assert "ssas_pbi_mv_migration_catalog.test_ssas" in combined
+    assert TEST_FQN in combined
 
 
 def test_export_zip_without_model_returns_400():
@@ -321,8 +328,8 @@ def test_export_zip_without_model_returns_400():
 def test_export_sql_returns_single_ordered_sql_file():
     response = client.post("/api/export/sql", json={
         "model": INLINE_MODEL,
-        "catalog": "ssas_pbi_mv_migration_catalog",
-        "schema": "test_ssas",
+        "catalog": TEST_CATALOG,
+        "schema": TEST_SCHEMA,
     })
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/sql")
@@ -330,14 +337,14 @@ def test_export_sql_returns_single_ordered_sql_file():
     text = response.content.decode()
     assert "dependency order" in text
     assert "CREATE OR REPLACE VIEW" in text
-    assert "ssas_pbi_mv_migration_catalog.test_ssas" in text
+    assert TEST_FQN in text
     # The combined file lists views in generated_sql order (already topo-sorted):
     # each view's CREATE statement appears in the same relative order.
     import re
     ddls = client.post("/api/generate-ddl", json={
         "model": INLINE_MODEL,
-        "catalog": "ssas_pbi_mv_migration_catalog",
-        "schema": "test_ssas",
+        "catalog": TEST_CATALOG,
+        "schema": TEST_SCHEMA,
     }).json()["generated_sql"]
     view_re = re.compile(r"CREATE\s+OR\s+REPLACE\s+VIEW\s+([^\s(]+)", re.IGNORECASE)
     expected = [m.group(1) for ddl in ddls.values() if (m := view_re.search(ddl or ""))]
@@ -357,8 +364,8 @@ def test_export_sql_emits_tables_before_views():
     (CREATE OR REPLACE TABLE ...) BEFORE the first metric view."""
     response = client.post("/api/export/sql", json={
         "model": INLINE_MODEL,
-        "catalog": "ssas_pbi_mv_migration_catalog",
-        "schema": "test_ssas",
+        "catalog": TEST_CATALOG,
+        "schema": TEST_SCHEMA,
     })
     assert response.status_code == 200
     text = response.content.decode()
