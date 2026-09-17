@@ -91,16 +91,29 @@ merge_fact_groups:
     target_source: gold.fact_sales_unified
 
 # ---------------------------------------------------------------------------
-# Manually override the generated SQL expression for a measure.
-# Use this when the automatic DAX-to-SQL translation is incorrect or
-# when you want to inject a hand-tuned expression.
-#   expr    - the SQL expression (use "source" as the table alias)
-#   comment - optional note stored alongside the metric view definition
-# ---------------------------------------------------------------------------
+# Manually override a measure when the automatic DAX-to-SQL translation is
+# wrong or when the converter gives up on it.
+#
+# An override that sets `expr` FULLY REPLACES the conversion for that measure:
+#   * its expr/window are used verbatim instead of the auto-translated ones, and
+#   * it OVERRIDES every exclusion — a measure the converter dropped (residual
+#     DAX, aggregate-inside-FILTER, non-aggregating, or excluded upstream) is
+#     re-included with your hand-authored definition.
+# Omit `expr` to only layer metadata (display_name / synonyms / format) or a
+# `window` tweak onto the auto-converted measure.
+#
+# Keys:
+#   expr         - SQL expression (alias the fact as "source"; reference other
+#                  measures with MEASURE(`Other`); reference a joined dim as
+#                  <join_alias>.<column>)
+#   window       - Metric View window list. Each entry: order / range /
+#                  semiadditive / offset. `order` must name a dimension (the
+#                  generator will expose a fact/joined column, or a
+#                  `<col>__month|quarter|year` period grain, as one on demand).
+#   comment      - note stored alongside the metric view definition
 #   display_name - human-readable label shown in downstream tools (dashboards, Genie)
 #   synonyms     - alternate names that improve Genie / Genie-Code accuracy
 #   format       - Metric View format object, e.g. {type: currency, currency_code: USD}
-#   window       - Metric View window list, e.g. [{order: order_date, range: "trailing 7 day", semiadditive: last}]
 measure_overrides:
   "Complex KPI":
     expr: "SUM(source.revenue) / NULLIF(COUNT(DISTINCT source.customer_id), 0)"
@@ -108,9 +121,27 @@ measure_overrides:
     display_name: "Revenue per Customer"
     synonyms: ["ARPU", "revenue per account"]
     format: {type: currency, currency_code: USD}
-  "YTD Revenue":
-    expr: "SUM(CASE WHEN YEAR(source.order_date) = YEAR(CURRENT_DATE) THEN source.revenue ELSE 0 END)"
-    comment: "DAX DATESYTD replaced with inline CASE expression"
+
+  # Period-to-date that resets at the month boundary. The reset is a second,
+  # nested window entry ordered by a `<date_col>__month` period grain; the
+  # generator materializes it as date_trunc('MONTH', <date_col>). Use this to
+  # hand-fix an MTD/YTD measure the converter mishandled.
+  "MTD Revenue":
+    expr: "MEASURE(`Daily Revenue`)"
+    window:
+      - {order: order_date, range: cumulative, semiadditive: last}
+      - {order: order_date__month, range: current, semiadditive: last}
+    format: {type: currency, currency_code: USD}
+
+  # Same period last year (a point shift). `range: current` + `offset` returns
+  # the value at the same grain one year earlier — resolves even under a single
+  # -date filter. (Never a size-less `trailing`; that is invalid on a
+  # DATE/TIMESTAMP order column.)
+  "SPLY Revenue":
+    expr: "MEASURE(`Daily Revenue`)"
+    window:
+      - {order: order_date, range: current, semiadditive: last, offset: -12 month}
+    format: {type: currency, currency_code: USD}
 
 # ---------------------------------------------------------------------------
 # Override display metadata for generated dimensions.

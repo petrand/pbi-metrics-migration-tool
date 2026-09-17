@@ -10,7 +10,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ class TranslationResult:
     applied_transformations: List[str] = field(default_factory=list)
     issues: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
-    window_spec: Optional[dict] = None
+    window_spec: Optional[Union[dict, list]] = None
     rls_applied: bool = False
 
     def to_dict(self) -> dict:
@@ -433,15 +433,22 @@ class DAXTranslator:
         YAML generator renders it as a window list. ``None`` when no
         time-intelligence is present.
         """
-        # Cumulative period-to-date windows.
+        # Cumulative period-to-date windows. A bare `range: cumulative` is an
+        # unbounded running total; period-to-date semantics (MTD/QTD/YTD) require
+        # the accumulation to RESET at the period boundary. That reset is a second,
+        # nested window entry: `range: current` ordered by a period-truncated grain
+        # (e.g. date_trunc('MONTH', date)). Without it the measure only behaves as
+        # *TD when the consuming query happens to group by that period; at a finer
+        # grain it silently returns a running total across all periods.
+        #
+        # The reset entry orders by a synthetic `<date_col>__<period>` dimension;
+        # the YAML generator materializes it as date_trunc('<PERIOD>', <date_col>).
+        # A prior-year offset (LY MTD/YTD), when built by the generator's offset
+        # pushdown, is merged onto BOTH entries — shifting the reset anchor too,
+        # which is required or the un-shifted `current` anchor nulls the result.
         for func, period in self._TI_CUMULATIVE.items():
             if re.search(rf'\b{func}\b', dax_expr, re.IGNORECASE):
                 date_col = self._find_date_column(dax_expr, func)
-                if period != "year":
-                    self._warnings.append(
-                        f"{func} mapped to a cumulative window; verify {period}ly "
-                        "period-reset semantics"
-                    )
                 # A fiscal-year anchor (e.g. DATESYTD(dates, \"30-06\")) can't be
                 # expressed directly in the window — surface it for review.
                 if re.search(r'"\d{1,2}-\d{1,2}"', dax_expr):
@@ -449,7 +456,11 @@ class DAXTranslator:
                         "Fiscal-year anchor detected; confirm the source table's "
                         "date grain reflects the fiscal calendar"
                     )
-                return {"order": date_col, "range": "cumulative", "semiadditive": "last"}
+                return [
+                    {"order": date_col, "range": "cumulative", "semiadditive": "last"},
+                    {"order": f"{date_col}__{period}", "range": "current",
+                     "semiadditive": "last"},
+                ]
 
         # Prior-period comparisons -> window offset. Metric View period offsets
         # are best-effort here; flag for manual verification.
@@ -460,7 +471,12 @@ class DAXTranslator:
                     f"{func} mapped to a prior-year window offset; verify offset "
                     "semantics or supply a measure_override"
                 )
-                return {"order": date_col, "range": "trailing", "offset": "-1 year",
+                # Point period-over-period shift: anchor on the current row and
+                # slide it back with `offset`. `range: current` keeps the same
+                # grain as the base measure and works even under a single-date
+                # filter; a size-less `trailing` is invalid on a non-numeric
+                # (DATE/TIMESTAMP) order column.
+                return {"order": date_col, "range": "current", "offset": "-1 year",
                         "semiadditive": "last"}
 
         # DATEADD(dates, -n, YEAR|MONTH|QUARTER) -> offset window.
@@ -470,7 +486,9 @@ class DAXTranslator:
             date_col = self._find_date_column(dax_expr, "DATEADD")
             offset = f"{m.group(2)} {m.group(3).lower()}"
             self._warnings.append("DATEADD mapped to a window offset; verify offset semantics")
-            return {"order": date_col, "range": "trailing", "offset": offset,
+            # Point shift by a fixed interval -> anchor on the current row and
+            # slide it with `offset` (see prior-year branch above).
+            return {"order": date_col, "range": "current", "offset": offset,
                     "semiadditive": "last"}
 
         return None

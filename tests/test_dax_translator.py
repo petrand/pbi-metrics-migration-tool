@@ -272,16 +272,39 @@ def test_calculate_filter_converts_dax_double_quotes():
 
 # ── Time Intelligence ─────────────────────────────────────────────────────────
 
-def test_totalytd_produces_window_spec():
+def test_totalytd_produces_compound_window_spec():
     result = translator().translate(
         "TOTALYTD(SUM(FactSales[SalesAmount]), FactSales[OrderDate])",
         "FactSales",
     )
     assert result.window_spec is not None
-    assert result.window_spec.get("range") == "cumulative"
-    # Spec-compliant window keys: `order` (the date column), not `group_by`.
-    assert result.window_spec.get("order") == "orderdate"
-    assert "group_by" not in result.window_spec
+    # Period-to-date is a compound window: cumulative over the date, then a
+    # `current` reset at the period grain so it doesn't run on across years.
+    assert isinstance(result.window_spec, list) and len(result.window_spec) == 2
+    cumulative, reset = result.window_spec
+    assert cumulative == {"order": "orderdate", "range": "cumulative",
+                          "semiadditive": "last"}
+    assert reset == {"order": "orderdate__year", "range": "current",
+                     "semiadditive": "last"}
+    for w in result.window_spec:
+        assert "group_by" not in w
+
+
+def test_totalmtd_reset_grain_is_month():
+    result = translator().translate(
+        "TOTALMTD(SUM(FactSales[SalesAmount]), FactSales[OrderDate])",
+        "FactSales",
+    )
+    assert result.window_spec[1]["order"] == "orderdate__month"
+    assert result.window_spec[1]["range"] == "current"
+
+
+def test_totalqtd_reset_grain_is_quarter():
+    result = translator().translate(
+        "TOTALQTD(SUM(FactSales[SalesAmount]), FactSales[OrderDate])",
+        "FactSales",
+    )
+    assert result.window_spec[1]["order"] == "orderdate__quarter"
 
 
 def test_totalytd_inner_expression_preserved():
@@ -291,6 +314,38 @@ def test_totalytd_inner_expression_preserved():
     )
     # Inner aggregate expression should be present
     assert "SUM" in result.translated_sql or "salesamount" in result.translated_sql
+
+
+def test_sameperiodlastyear_uses_current_range_with_offset():
+    # Prior-year comparisons are a point shift: `range: current` + `offset`,
+    # never a size-less `trailing` (which is invalid on a DATE/TIMESTAMP order
+    # column -> INCOMPATIBLE_ORDER_COLUMN_TYPE).
+    result = translator().translate(
+        "CALCULATE(SUM(FactSales[SalesAmount]), SAMEPERIODLASTYEAR(FactSales[OrderDate]))",
+        "FactSales",
+    )
+    assert result.window_spec is not None
+    assert result.window_spec.get("range") == "current"
+    assert result.window_spec.get("offset") == "-1 year"
+
+
+def test_previousyear_uses_current_range():
+    result = translator().translate(
+        "CALCULATE(SUM(FactSales[SalesAmount]), PREVIOUSYEAR(FactSales[OrderDate]))",
+        "FactSales",
+    )
+    assert result.window_spec is not None
+    assert result.window_spec.get("range") == "current"
+
+
+def test_dateadd_offset_uses_current_range():
+    result = translator().translate(
+        "CALCULATE(SUM(FactSales[SalesAmount]), DATEADD(FactSales[OrderDate], -1, YEAR))",
+        "FactSales",
+    )
+    assert result.window_spec is not None
+    assert result.window_spec.get("range") == "current"
+    assert result.window_spec.get("offset") == "-1 year"
 
 
 # ── Measure References ────────────────────────────────────────────────────────

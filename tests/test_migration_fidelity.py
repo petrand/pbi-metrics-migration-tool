@@ -110,7 +110,11 @@ def test_e2_nested_if():
 def test_e3_datesytd_to_cumulative_window():
     t = DAXTranslator()
     r = t.translate('CALCULATE([Daily Sales], DATESYTD(Calendar[Date], "30-06"))', "Sales")
-    assert r.window_spec and r.window_spec.get("range") == "cumulative"
+    # Period-to-date is a compound window: cumulative over the date + a `current`
+    # reset at the period grain (so YTD doesn't run on across years).
+    assert isinstance(r.window_spec, list) and len(r.window_spec) == 2
+    assert r.window_spec[0].get("range") == "cumulative"
+    assert r.window_spec[1].get("range") == "current"
     assert "CALCULATE" not in r.translated_sql.upper()
 
 
