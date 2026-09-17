@@ -202,6 +202,24 @@ class MetricViewValidator:
                         issues.append(ValidationIssue("warning", "yaml_structure",
                                                       "Window missing 'range'",
                                                       f"{loc}.window[{widx}]"))
+                    else:
+                        # `trailing`/`leading` are sized frames and require a
+                        # count + unit (e.g. `trailing 7 day`). A bare keyword is
+                        # read as a unitless numeric range and fails on a
+                        # DATE/TIMESTAMP order column with
+                        # INCOMPATIBLE_ORDER_COLUMN_TYPE. Point shifts should use
+                        # `range: current` with an `offset` instead.
+                        rng = str(w["range"]).strip().lower()
+                        kw = rng.split()[0] if rng else ""
+                        if kw in ("trailing", "leading") and not re.search(
+                                r"\b(trailing|leading)\s+\d+\s+\w+", rng):
+                            issues.append(ValidationIssue(
+                                "error", "yaml_structure",
+                                f"Window range '{w['range']}' is missing a size; "
+                                f"use '{kw} N unit' (e.g. '{kw} 7 day') for a "
+                                "rolling frame, or 'range: current' with an "
+                                "'offset' for a period-over-period shift",
+                                f"{loc}.window[{widx}]"))
 
         # Cross-reference: join aliases used in expressions
         issues.extend(self._check_join_references(doc, join_names))

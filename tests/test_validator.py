@@ -311,3 +311,38 @@ def test_warnings_count_property_counts_warnings():
     ]
     r = ValidationResult(valid=False, issues=issues)
     assert r.warnings_count == 1
+
+
+# ── Window range validation ───────────────────────────────────────────────────
+
+def _doc_with_window(window):
+    return {
+        "version": "1.1",
+        "source": "catalog.schema.fact_sales",
+        "measures": [{
+            "name": "sply_sales",
+            "expr": "MEASURE(`total_revenue`)",
+            "window": [window],
+        }],
+    }
+
+
+def test_sizeless_trailing_range_produces_error():
+    # A bare `trailing` (no count+unit) is invalid on a DATE/TIMESTAMP order col.
+    result = v().validate_yaml_dict(
+        _doc_with_window({"order": "date", "range": "trailing", "offset": "-1 year"}))
+    assert not result.valid
+    assert any(i.severity == "error" and "size" in i.message.lower()
+               for i in result.issues)
+
+
+def test_sized_trailing_range_is_accepted():
+    result = v().validate_yaml_dict(
+        _doc_with_window({"order": "date", "range": "trailing 7 day"}))
+    assert not any("size" in i.message.lower() for i in result.issues)
+
+
+def test_current_range_with_offset_is_accepted():
+    result = v().validate_yaml_dict(
+        _doc_with_window({"order": "date", "range": "current", "offset": "-1 year"}))
+    assert not any("size" in i.message.lower() for i in result.issues)

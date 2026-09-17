@@ -390,6 +390,29 @@ class MetricViewYAMLGenerator:
         # measure name -> reason it was excluded from the deployable view.
         excluded: dict = {}
         for tm in translated_measures:
+            # Manual override with an explicit `expr` fully REPLACES the
+            # conversion — it takes precedence over the auto-translated SQL and
+            # over every exclusion guard below, so a measure the converter can't
+            # translate (residual DAX, aggregate-in-filter, non-aggregating, or
+            # excluded upstream) can still be authored by hand in the overrides
+            # YAML. Metadata-only overrides (display_name/synonyms/format, or a
+            # window tweak) are still layered onto the auto-conversion at
+            # _apply_measure_override below.
+            ov = self._measure_override(overrides, tm["name"])
+            if ov is not None and getattr(ov, "expr", ""):
+                m = MetricViewMeasure(name=tm["name"], expr=ov.expr)
+                if getattr(ov, "window", None):
+                    m.window = ov.window
+                if getattr(ov, "comment", ""):
+                    m.comment = ov.comment
+                if getattr(ov, "format", None):
+                    m.format = ov.format
+                if getattr(ov, "display_name", ""):
+                    m.display_name = ov.display_name
+                if getattr(ov, "synonyms", None):
+                    m.synonyms = list(ov.synonyms)
+                spec.measures.append(m)
+                continue
             if tm.get("status") in ("excluded",):
                 # Excluded upstream (e.g. failed translation, calculated-table or
                 # private measure). Record it so the drop is never silent — the
@@ -533,6 +556,32 @@ class MetricViewYAMLGenerator:
                 match = dim_by_lower.get(str(order).lower())
                 if match:
                     w["order"] = match  # align to the existing dimension name
+                    continue
+                # Period-reset grain from a cumulative window: a synthetic
+                # `<col>__<period>` order (see DAXTranslator._extract_window_spec).
+                # Materialize it as date_trunc('<PERIOD>', <col>) over the same
+                # base column the cumulative entry orders by (fact or joined).
+                reset = re.match(r'^(.*)__(month|quarter|year)$', str(order), re.I)
+                if reset:
+                    base, grain = reset.group(1), reset.group(2).upper()
+                    base_col = _sanitize_name(base)
+                    fact_cols = known_columns.get(fact_table_lower) if known_columns else None
+                    src = None
+                    if fact_cols is None or base_col in fact_cols:
+                        src = f"source.{base_col}"
+                    else:
+                        alias = next(
+                            (a for a in valid_join_aliases
+                             if base_col in (known_columns.get(a) or set())), None)
+                        if alias:
+                            src = f"{alias}.{base_col}"
+                    if src:
+                        spec.dimensions.append(MetricViewDimension(
+                            name=order, expr=f"date_trunc('{grain}', {src})"))
+                        dim_by_lower[str(order).lower()] = order
+                        w["order"] = order
+                        continue
+                    order_unresolved[m.name] = str(order)
                     continue
                 ord_col = _sanitize_name(str(order))
                 fact_cols = known_columns.get(fact_table_lower) if known_columns else None
@@ -1059,15 +1108,27 @@ class MetricViewYAMLGenerator:
             dim.synonyms = list(ov.synonyms)
 
     @staticmethod
-    def _apply_measure_override(measure, name, overrides):
+    def _measure_override(overrides, name):
+        """Case-insensitive lookup of a MeasureOverride by name (or None)."""
         d = getattr(overrides, "measure_overrides", None) if overrides else None
         if not d:
-            return
-        ov = d.get(name) or next(
+            return None
+        return d.get(name) or next(
             (v for k, v in d.items() if k.lower() == name.lower()), None
         )
+
+    def _apply_measure_override(self, measure, name, overrides):
+        # Layer metadata (and an optional window tweak) onto an auto-converted
+        # measure. A full expr replacement is handled earlier in build_spec (it
+        # bypasses the exclusion guards); here `expr` is applied too for symmetry
+        # in case an override reaches a measure that was not excluded.
+        ov = self._measure_override(overrides, name)
         if not ov:
             return
+        if getattr(ov, "expr", ""):
+            measure.expr = ov.expr
+        if getattr(ov, "window", None):
+            measure.window = ov.window
         if getattr(ov, "display_name", ""):
             measure.display_name = ov.display_name
         if getattr(ov, "synonyms", None):
